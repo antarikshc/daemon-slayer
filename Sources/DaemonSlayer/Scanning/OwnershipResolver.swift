@@ -232,11 +232,18 @@ final class OwnershipResolver {
         let status = proc.terminationStatus
         let output = String(data: stdoutData, encoding: .utf8) ?? ""
 
-        // lsof exits 1 when some pids own no sockets — NORMAL; parse whatever
-        // output exists. Only a truly empty output with nonzero exit is failure.
-        if output.isEmpty && status != 0 {
-            let err = String(data: stderr.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-            logger.warn("OwnershipResolver: lsof exit \(status) with no output: \(err.trimmingCharacters(in: .whitespacesAndNewlines)); ownershipUnknown")
+        // lsof exits 1 when the target pids own NO matching sockets — this is the
+        // NORMAL "idle daemon, no listener, no client" case and yields empty
+        // stdout with empty stderr. It is NOT a failure: it must parse to an empty
+        // (but successful) result so the daemon reads as clientless, not
+        // ownershipUnknown. A genuine failure (bad pid syntax, lsof internal
+        // error) writes a diagnostic to STDERR — that is the real discriminator,
+        // not empty stdout. (spec §13 row 8: ownershipUnknown is reserved for a
+        // real timeout/spawn failure, not "found nothing".)
+        let err = String(data: stderr.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        let errTrimmed = err.trimmingCharacters(in: .whitespacesAndNewlines)
+        if output.isEmpty && status != 0 && !errTrimmed.isEmpty {
+            logger.warn("OwnershipResolver: lsof exit \(status) with no output and stderr: \(errTrimmed); ownershipUnknown")
             return nil
         }
 
