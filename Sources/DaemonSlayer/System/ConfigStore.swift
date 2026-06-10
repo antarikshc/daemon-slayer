@@ -7,7 +7,7 @@ import Foundation
 /// a real tokenizer (a `//` inside a string value would be mangled), and the spec's
 /// default file uses only whole-line and trailing comments on simple lines anyway.
 final class ConfigStore {
-    private let path: String
+    let path: String
     private let logger: DSLogger
 
     private let queue = DispatchQueue(label: "dev.antariksh.daemonslayer.configstore")
