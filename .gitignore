@@ -1,0 +1,9 @@
+.build/
+.swiftpm/
+dist/
+*.xcodeproj
+.DS_Store
+*.log
+# docs are intentionally untracked
+SPEC.md
+PLAN.md
