@@ -25,6 +25,18 @@ struct ProcessIdentity: Hashable, Codable {
 
 // MARK: - Scanner output
 
+/// One row of the same-user process table. Produced by ProcessScanner, consumed
+/// by OwnershipResolver (parent-chain walks, peer classification).
+struct RawProcess {
+    let pid: Int32
+    let ppid: Int32
+    let startTimeMicros: Int64
+    let rssBytes: UInt64
+    /// Cumulative user+system CPU seconds since process start.
+    let cpuTimeSeconds: Double
+    let argv: [String]
+}
+
 /// One watched daemon process as seen in a single scan. Stateless snapshot —
 /// cumulative CPU time deltas are computed by the RuleEngine across snapshots.
 struct DaemonProcess: Codable {
@@ -100,6 +112,25 @@ struct PollSnapshot: Codable {
     var daemons: [DaemonObservation]
     /// True iff any configured owner app (IDE) is currently running.
     var ideRunning: Bool
+}
+
+// MARK: - Ownership predicate (spec §5.1)
+
+/// Shared by RuleEngine (per-poll evaluation) and Killer (kill-time
+/// re-validation, spec §7). Pure function of one snapshot. `ownershipUnknown`
+/// handling is NOT done here — callers decide (engine keeps previous verdict,
+/// killer fails safe toward "owned").
+enum Ownership {
+    static func isOwned(_ d: DaemonObservation, in snapshot: PollSnapshot) -> Bool {
+        if d.parentIsIDE || d.hasAttachedClient { return true }
+        // O4 — a Kotlin daemon inherits the verdict of the Gradle daemon it
+        // serves (the gradle's own O1/O2, not another transitive hop).
+        if d.process.kind == .kotlin, let gpid = d.linkedGradlePid,
+           let gradle = snapshot.daemons.first(where: { $0.process.pid == gpid && $0.process.kind == .gradle }) {
+            return gradle.parentIsIDE || gradle.hasAttachedClient
+        }
+        return false
+    }
 }
 
 // MARK: - Rules (spec §5.2)
