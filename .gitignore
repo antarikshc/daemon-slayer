@@ -7,3 +7,4 @@ dist/
 # docs are intentionally untracked
 SPEC.md
 PLAN.md
+.claude/

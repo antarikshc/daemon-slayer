@@ -52,12 +52,6 @@ final class Killer {
     private func run(_ targets: [FlaggedProcess]) -> [KillReport] {
         guard !targets.isEmpty else { return [] }
 
-        // ONE fresh snapshot for the whole batch (spec §7 requirement 2).
-        guard let snapshot = deps.freshSnapshot() else {
-            logger.error("kill aborted — revalidation scan failed; signalling nothing (fail-safe)")
-            return targets.map { KillReport(target: $0, outcome: .failed("revalidation scan failed")) }
-        }
-
         let escalation = max(0.1, deps.escalationSeconds())
 
         // Kill order (spec §7 requirement 4): ALL Kotlin daemons fully resolved
@@ -66,9 +60,35 @@ final class Killer {
         let kotlin = targets.filter { $0.process.kind == .kotlin }
         let gradle = targets.filter { $0.process.kind == .gradle }
 
+        // Re-validate per PHASE, not once per batch (spec §7, goal #4). The kotlin
+        // phase can take 10–20+ s of escalation waits; a build may attach to a
+        // gradle daemon during it. A single batch-wide snapshot would miss that and
+        // kill a now-busy daemon. So each phase takes its OWN fresh snapshot +
+        // full revalidation immediately before signalling that phase's targets.
         var reports: [KillReport] = []
-        reports.append(contentsOf: resolvePhase(kotlin, snapshot: snapshot, escalation: escalation))
-        reports.append(contentsOf: resolvePhase(gradle, snapshot: snapshot, escalation: escalation))
+
+        // Phase 1 — Kotlin daemons.
+        if !kotlin.isEmpty {
+            guard let snapshot = deps.freshSnapshot() else {
+                logger.error("kill aborted — phase-1 (kotlin) revalidation scan failed; signalling nothing (fail-safe)")
+                return targets.map { KillReport(target: $0, outcome: .failed("revalidation scan failed")) }
+            }
+            reports.append(contentsOf: resolvePhase(kotlin, snapshot: snapshot, escalation: escalation, phase2: false))
+        }
+
+        // Phase 2 — Gradle daemons. A SECOND fresh snapshot taken AFTER the kotlin
+        // phase, re-validating gradle targets against current truth. Anything that
+        // picked up a build between phases is skipped (.skippedNowOwned / .skippedGone),
+        // exactly like phase 1.
+        if !gradle.isEmpty {
+            guard let snapshot = deps.freshSnapshot() else {
+                logger.error("kill aborted — phase-2 (gradle) revalidation scan failed; signalling nothing (fail-safe)")
+                reports.append(contentsOf: gradle.map { KillReport(target: $0, outcome: .failed("revalidation scan failed")) })
+                return reports
+            }
+            reports.append(contentsOf: resolvePhase(gradle, snapshot: snapshot, escalation: escalation, phase2: true))
+        }
+
         return reports
     }
 
@@ -76,7 +96,8 @@ final class Killer {
     /// the caller's phase ordering (Kotlin → Gradle) is preserved.
     private func resolvePhase(_ targets: [FlaggedProcess],
                               snapshot: PollSnapshot,
-                              escalation: Double) -> [KillReport] {
+                              escalation: Double,
+                              phase2: Bool) -> [KillReport] {
         guard !targets.isEmpty else { return [] }
 
         let group = DispatchGroup()
@@ -88,7 +109,7 @@ final class Killer {
             workers.async { [weak self] in
                 defer { group.leave() }
                 guard let self = self else { return }
-                let report = self.resolveOne(target, snapshot: snapshot, escalation: escalation)
+                let report = self.resolveOne(target, snapshot: snapshot, escalation: escalation, phase2: phase2)
                 lock.lock(); results[i] = report; lock.unlock()
             }
         }
@@ -107,14 +128,15 @@ final class Killer {
 
     private func resolveOne(_ target: FlaggedProcess,
                             snapshot: PollSnapshot,
-                            escalation: Double) -> KillReport {
+                            escalation: Double,
+                            phase2: Bool) -> KillReport {
         let proc = target.process
         let pid = proc.pid
 
         // (3) Re-validate EVERY target against the fresh snapshot before any
         // signal. A daemon that picked up a new build or owner since the
         // notification must be skipped (spec §7, goal #4).
-        switch revalidate(target, in: snapshot) {
+        switch revalidate(target, in: snapshot, phase2: phase2) {
         case .skip(let outcome):
             return KillReport(target: target, outcome: outcome)
         case .proceed:
@@ -161,7 +183,7 @@ final class Killer {
         case skip(KillOutcome)
     }
 
-    private func revalidate(_ target: FlaggedProcess, in snapshot: PollSnapshot) -> Revalidation {
+    private func revalidate(_ target: FlaggedProcess, in snapshot: PollSnapshot, phase2: Bool) -> Revalidation {
         let proc = target.process
         let pid = proc.pid
 
@@ -169,7 +191,8 @@ final class Killer {
         guard let obs = snapshot.daemons.first(where: {
             $0.process.pid == pid && $0.process.identity.startTimeMicros == proc.identity.startTimeMicros
         }) else {
-            logger.info("skipped pid \(pid) (\(proc.displayName)) — gone or PID reused (no matching observation)")
+            let extra = phase2 ? " (phase-2 revalidation)" : ""
+            logger.info("skipped pid \(pid) (\(proc.displayName)) — gone or PID reused (no matching observation)\(extra)")
             return .skip(.skippedGone)
         }
 
@@ -187,7 +210,12 @@ final class Killer {
             return .skip(.skippedNowOwned)
         }
         if Ownership.isOwned(obs, in: snapshot) {
-            logger.info("skipped pid \(pid) (\(proc.displayName)) — now owned (client attached)")
+            if phase2 {
+                // A gradle daemon that gained an owner DURING the kotlin phase (spec §7).
+                logger.info("skipped pid \(pid) (\(proc.displayName)) — now busy — build attached between phases (phase-2 revalidation)")
+            } else {
+                logger.info("skipped pid \(pid) (\(proc.displayName)) — now owned (client attached)")
+            }
             return .skip(.skippedNowOwned)
         }
 
@@ -197,12 +225,14 @@ final class Killer {
     // MARK: - Marker-file shutdown (spec §7 step 1)
 
     /// Delete the Kotlin alive-marker (clean self-shutdown) and poll for exit.
-    /// DEFENSE: only unlink a path whose last component contains "kotlin" — a
-    /// hostile/garbled argv must never make us delete an arbitrary file.
+    /// DEFENSE: only unlink a path whose last component contains "kotlin" AND ends
+    /// in ".alive" (the spec'd marker naming, §5.4) — a hostile/garbled argv must
+    /// never make us delete an arbitrary file.
     private func tryMarkerShutdown(_ markerPath: String, pid: Int32, name: String, escalation: Double) -> Bool {
         let lastComponent = (markerPath as NSString).lastPathComponent
-        guard lastComponent.lowercased().contains("kotlin") else {
-            logger.warn("pid \(pid) (\(name)) — refusing to unlink marker '\(markerPath)' (name doesn't contain 'kotlin'); skipping marker step")
+        let lower = lastComponent.lowercased()
+        guard lower.contains("kotlin") && lower.hasSuffix(".alive") else {
+            logger.warn("pid \(pid) (\(name)) — refusing to unlink marker '\(markerPath)' (name must contain 'kotlin' and end in '.alive'); skipping marker step")
             return false
         }
 

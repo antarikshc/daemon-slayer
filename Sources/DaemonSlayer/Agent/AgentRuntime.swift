@@ -69,12 +69,8 @@ final class AgentRuntime {
 
         notifier.bootstrap { [weak self] granted in
             guard let self else { return }
-            if !granted, !self.notifier.dryRun {
-                // Spec §13 row 11: keep running, but be loud about it.
-                self.logger.error("notification permission DENIED — notifications are off. "
-                    + "Enable in System Settings → Notifications → DaemonSlayer. "
-                    + "Auto-kill (if enabled) still functions.")
-            }
+            // Denial is logged by NotificationManager.bootstrap (the auth owner); no
+            // duplicate "permission DENIED" line here (spec §13 row 11).
             if granted, isFirstRun { self.notifier.postTest() }
         }
 
@@ -184,8 +180,13 @@ final class AgentRuntime {
         logger.minLevel = newConfig.logLevelValue
         ideMonitor.updatePrefixes(newConfig.ownerAppBundlePrefixes)
         engine.updateConfig(newConfig)
-        scheduleTimer(interval: currentInterval == 0 ? newConfig.pollIntervalSeconds
-                                                     : min(currentInterval, newConfig.pollIntervalSeconds))
+        // Do NOT touch the timer here: rescheduling on every save resets the timer
+        // PHASE (repeated saves can starve polling) and pins fast cadence even when
+        // idle. Instead run one immediate out-of-band poll (apply() already runs on
+        // pollQueue) with the fresh thresholds; poll()'s tail re-establishes the
+        // correct cadence (desired != currentInterval → scheduleTimer) and leaves an
+        // unchanged-interval timer's existing phase alone.
+        poll()
     }
 
     private func writeState() {

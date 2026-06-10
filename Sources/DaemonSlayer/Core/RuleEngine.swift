@@ -307,9 +307,13 @@ final class RuleEngine {
         }
         // R4 — runaway: !hasAttachedClient && cpuPercent > threshold. Ignores `owned`
         //      deliberately (spec table: clientless + hot). Unmatchable on first sample.
+        //      Fail-safe (spec §13 row 8): when lsof failed this cycle the resolver
+        //      hard-codes hasAttachedClient=false, so a busy daemon could spuriously look
+        //      clientless+hot. ownershipUnknown → R4 must NOT match (fail toward not
+        //      flagging); the counter resets via normal non-match semantics.
         if isEnabled(.runaway) {
             let threshold = config.rules.runaway.cpuThresholdPercent ?? 50
-            if let pct = d.cpuPercent {
+            if let pct = d.cpuPercent, !obs.ownershipUnknown {
                 d.matches[.runaway] = !obs.hasAttachedClient && pct > threshold
             } else {
                 d.matches[.runaway] = false
@@ -349,8 +353,12 @@ final class RuleEngine {
         guard let gpid = obs.linkedGradlePid,
               let gradle = snapshot.daemons.first(where: { $0.process.pid == gpid && $0.process.kind == .gradle })
         else { return }
-        // Lockstep only when the Gradle is NOT owned this sample (an orphan candidate).
+        // O4 is an EXTRA ownership source that ORs with the Kotlin's own O1/O2 (spec §5.1):
+        // a Kotlin with its own attached client / IDE parent is owned regardless of its
+        // Gradle, so it must never inherit an unowned Gradle's orphan counters. Lockstep
+        // only when BOTH the Gradle AND the Kotlin are un-owned this sample.
         guard ownedByPid[gradle.process.pid] == false else { return }
+        guard ownedByPid[obs.process.pid] == false else { return }
         guard let kst = states[obs.process.identity], let gst = states[gradle.process.identity] else { return }
         for rule in [Rule.ownerlessNoIDE, .ownerlessWithIDE, .idleTooLong] {
             kst.counters[rule] = gst.counters[rule]

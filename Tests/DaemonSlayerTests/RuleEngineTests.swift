@@ -462,6 +462,86 @@ final class RuleEngineTests: XCTestCase {
         XCTAssertEqual(orphanBatch(out)?.processes.first?.rule, .ownerlessNoIDE)
     }
 
+    // MARK: - R4 fail-safe under ownershipUnknown (FIX 1, spec §13 row 8)
+
+    func testR4NeverFiresWhileOwnershipUnknownThenFiresAfterFreshWindowWhenKnown() {
+        // A clientless daemon burning CPU, but lsof fails every sample
+        // (ownershipUnknown=true → resolver hard-codes hasAttachedClient=false). R4 must
+        // NOT fire on those samples — fail toward not flagging (spec §13 row 8).
+        let e = engine()
+        let required = Config.default.requiredConsecutiveSamples(for: .runaway)  // 4
+        var cpu = 0.0
+        // Baseline (no delta) + many hot, unknown samples → never fires.
+        _ = e.ingest(snap(0, ideRunning: true, [obs(420, client: false, unknown: true, cpu: cpu)]))
+        for i in 1...(required + 4) {
+            cpu += 30  // 100% of a core
+            let out = e.ingest(snap(i, ideRunning: true, [obs(420, client: false, unknown: true, cpu: cpu)]))
+            XCTAssertNil(runawayBatch(out), "R4 must not fire while ownershipUnknown (i=\(i))")
+        }
+        // Flip ownershipUnknown to false: the unknown samples reset the counter (non-match),
+        // so a FULL fresh window of clientless+hot known samples is needed before it fires.
+        let base = required + 5
+        for i in base..<(base + required - 1) {
+            cpu += 30
+            let out = e.ingest(snap(i, ideRunning: true, [obs(420, client: false, unknown: false, cpu: cpu)]))
+            XCTAssertNil(runawayBatch(out), "fresh window not yet complete (i=\(i))")
+        }
+        cpu += 30
+        let out = e.ingest(snap(base + required - 1, ideRunning: true, [obs(420, client: false, unknown: false, cpu: cpu)]))
+        XCTAssertEqual(runawayBatch(out)?.processes.first?.rule, .runaway,
+                       "fires only after a full fresh window of known clientless+hot samples")
+    }
+
+    // MARK: - O4 lockstep must not override the Kotlin's own ownership (FIX 2)
+
+    func testO4KotlinWithOwnClientNeverInheritsUnownedGradleCounters() {
+        // (a) Kotlin has its OWN attached client (O2-owned) but links to an UNOWNED gradle.
+        // The gradle flags R1 on schedule; the Kotlin must NEVER inherit the gradle's
+        // counters and must NEVER flag (its own O2 ownership ORs over O4, spec §5.1).
+        let e = engine()
+        let req = Config.default.requiredConsecutiveSamples(for: .ownerlessNoIDE)  // 4
+        for i in 0..<(req - 1) {
+            let g = obs(1030, kind: .gradle, ppid: 1)                                  // unowned
+            let k = obs(1031, kind: .kotlin, ppid: 1, client: true, linkedGradlePid: 1030)  // own client
+            let out = e.ingest(snap(i, ideRunning: false, [g, k]))
+            XCTAssertTrue(out.notifications.isEmpty, "neither flags before threshold (i=\(i))")
+        }
+        let g = obs(1030, kind: .gradle, ppid: 1)
+        let k = obs(1031, kind: .kotlin, ppid: 1, client: true, linkedGradlePid: 1030)
+        let out = e.ingest(snap(req - 1, ideRunning: false, [g, k]))
+        let batch = orphanBatch(out)
+        XCTAssertNotNil(batch, "the unowned gradle flags on schedule")
+        XCTAssertEqual(batch?.processes.count, 1, "only the gradle flags; the owned Kotlin does not")
+        XCTAssertEqual(batch?.processes.first?.process.pid, 1030)
+        // The Kotlin's own R1 counter never inherited the gradle's run.
+        let kRec = e.stateRecords().first { $0.identity == identity(1031) }
+        XCTAssertEqual(kRec?.ruleCounters[Rule.ownerlessNoIDE.rawValue] ?? 0, 0,
+                       "owned Kotlin's R1 counter stays 0 — no inherited history")
+    }
+
+    func testO4KotlinInheritedCountersResetWhenGradleBecomesOwned() {
+        // (b) Gradle is an unowned candidate (Kotlin inherits via O4), then the gradle
+        // becomes owned (client attaches) → the Kotlin's inherited counters reset on the
+        // next sample, so no flag fires from stale inherited history.
+        let e = engine()
+        let req = Config.default.requiredConsecutiveSamples(for: .ownerlessNoIDE)  // 4
+        // 3 samples: gradle unowned, Kotlin linked + unowned (inherits gradle's R1 run).
+        for i in 0..<(req - 1) {
+            let g = obs(1040, kind: .gradle, ppid: 1)
+            let k = obs(1041, kind: .kotlin, ppid: 1, linkedGradlePid: 1040)
+            _ = e.ingest(snap(i, ideRunning: false, [g, k]))
+        }
+        // Sample req-1: gradle becomes OWNED (client attaches) → both reset (Kotlin via O4
+        // inheritance of the now-owned gradle), nothing fires.
+        let gOwned = obs(1040, kind: .gradle, ppid: 1, client: true)
+        let kLinked = obs(1041, kind: .kotlin, ppid: 1, linkedGradlePid: 1040)
+        let out = e.ingest(snap(req - 1, ideRunning: false, [gOwned, kLinked]))
+        XCTAssertTrue(out.notifications.isEmpty, "gradle owned → no flag from stale inherited Kotlin history")
+        let kRec = e.stateRecords().first { $0.identity == identity(1041) }
+        XCTAssertEqual(kRec?.ruleCounters[Rule.ownerlessNoIDE.rawValue] ?? 0, 0,
+                       "Kotlin's inherited R1 counter reset once the gradle became owned")
+    }
+
     // MARK: - ownershipUnknown
 
     func testOwnershipUnknownKeepsPreviousVerdict() {

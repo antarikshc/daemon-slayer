@@ -36,6 +36,9 @@ final class FileLogger: DSLogger {
         let fmt = ISO8601DateFormatter()
         // withTimeZone => "+0530" suffix; without colon to match the spec's sample line.
         fmt.formatOptions = [.withInternetDateTime]
+        // Local time, not the default UTC, so agent-log lines line up with --status
+        // output (which prints in local time).
+        fmt.timeZone = TimeZone.current
         self.dateFormatter = fmt
 
         if let path { handle = FileLogger.openHandle(at: path) }
