@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-DaemonSlayer — a macOS menu-less LaunchAgent (Swift, zero dependencies, macOS 13+) that detects orphaned Gradle/Kotlin daemon JVMs and notifies/kills them. `SPEC.md` in the repo root is the authoritative design doc (detection rules, kill semantics, config schema); `PLAN.md` tracks milestones and locked design decisions. Both are intentionally untracked in git — read them locally, don't commit them.
+DaemonSlayer — a macOS menu-less LaunchAgent (Swift, zero dependencies, macOS 13+) that detects orphaned Gradle/Kotlin daemon JVMs and notifies/kills them. `SPEC.md` in the repo root is the authoritative design doc for the v1 agent (detection rules, kill semantics, config schema); `SPEC-UI.md` is the v2 spec for the on-demand status/control window. Both are intentionally untracked in git — read them locally, don't commit them.
 
 ## Commands
 
