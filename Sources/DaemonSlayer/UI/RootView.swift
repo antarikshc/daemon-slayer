@@ -34,8 +34,11 @@ struct RootView: View {
         .animation(.easeOut(duration: 0.2), value: model.toast)
         // Auto-dismiss the toast after 4 s (SPEC-UI §6).
         .onChange(of: model.toast) { newValue in
-            guard newValue != nil else { return }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 4) { model.dismissToast() }
+            guard let shown = newValue else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
+                // A stale timer must not clear a newer toast.
+                if model.toast == shown { model.dismissToast() }
+            }
         }
     }
 }

@@ -63,7 +63,9 @@ final class OwnershipResolver {
                 peerPidByPort = runLsofPortOwners(ports: clientPorts)
             }
         }
-        let nameByPid = processNameByPid(allProcesses)
+        // Only consumed by the client-description mapping below — skip the table
+        // build entirely on the agent's opted-out path.
+        let nameByPid = resolveClientDescriptions ? processNameByPid(allProcesses) : [:]
 
         var observations: [DaemonObservation] = []
         observations.reserveCapacity(daemons.count)
