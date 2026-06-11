@@ -24,7 +24,9 @@ enum StatusCommand {
         let snapshot = OwnershipResolver(logger: logger).resolve(
             daemons: daemons, allProcesses: raw,
             idePids: ideMonitor.runningIDEPids(), ideRunning: ideMonitor.ideRunning,
-            timestamp: now)
+            timestamp: now,
+            // Debug/UI view: opt into the display-only client-name lsof.
+            resolveClientDescriptions: true)
 
         var out = "DaemonSlayer \(daemonSlayerVersion) — \(shortDate(now))\n"
         out += "IDE running: \(snapshot.ideRunning ? "yes" : "no")"
@@ -114,7 +116,10 @@ enum StatusCommand {
     private static func whyString(_ obs: DaemonObservation, owned: Bool) -> String {
         if obs.ownershipUnknown { return "lsof failed" }
         if obs.parentIsIDE { return "IDE parent" }
-        if obs.hasAttachedClient { return "client attached" }
+        if obs.hasAttachedClient {
+            if let who = obs.attachedClientDescription { return "client: \(who)" }
+            return "client attached"
+        }
         if owned, let gpid = obs.linkedGradlePid { return "via gradle \(gpid)" }
         if obs.process.isDetached { return "detached, no client" }
         return "no owner"

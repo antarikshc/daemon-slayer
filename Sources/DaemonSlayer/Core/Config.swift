@@ -103,6 +103,11 @@ struct Config: Codable, Equatable {
         "com.jetbrains.intellij",
     ]
     var logLevel: String = "info"
+    /// v2 (SPEC-UI §7.1/§8): when true the agent suspends ALL watching —
+    /// scanning, lsof, notifications, kills (incl. auto-kill) — but keeps watching
+    /// the config file (the resume channel) and keeps writing a state.json
+    /// heartbeat with `paused: true`. Default false → bit-for-bit v1 behaviour.
+    var paused: Bool = false
 
     static let `default` = Config()
 
@@ -122,6 +127,7 @@ struct Config: Codable, Equatable {
         autoKill = try c.decodeIfPresent(AutoKillConfig.self, forKey: .autoKill) ?? d.autoKill
         ownerAppBundlePrefixes = try c.decodeIfPresent([String].self, forKey: .ownerAppBundlePrefixes) ?? d.ownerAppBundlePrefixes
         logLevel = try c.decodeIfPresent(String.self, forKey: .logLevel) ?? d.logLevel
+        paused = try c.decodeIfPresent(Bool.self, forKey: .paused) ?? d.paused
 
         // Sanity clamps — a hostile/typo'd config must not melt the machine.
         pollIntervalSeconds = max(1, pollIntervalSeconds)

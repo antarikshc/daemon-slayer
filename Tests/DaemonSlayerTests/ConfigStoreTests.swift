@@ -104,6 +104,55 @@ final class ConfigStoreTests: XCTestCase {
         XCTAssertEqual(cfg.pollIntervalSeconds, 1)
     }
 
+    // MARK: - v2: paused key (SPEC-UI §8/§13)
+
+    func testPausedDefaultsFalseWhenAbsent() {
+        // A v1-shaped config (no `paused` key) → v2 agent reads paused = false.
+        let path = configPath()
+        write(#"{ "pollIntervalSeconds": 30 }"#, to: path)
+        let cfg = ConfigStore(path: path, logger: logger).load()
+        XCTAssertFalse(cfg.paused, "paused must default false (v1 config → running)")
+    }
+
+    func testPausedDecodesTrue() {
+        let path = configPath()
+        write(#"{ "paused": true }"#, to: path)
+        let cfg = ConfigStore(path: path, logger: logger).load()
+        XCTAssertTrue(cfg.paused)
+        // All other keys still default — paused doesn't disturb v1 keys.
+        XCTAssertEqual(cfg.pollIntervalSeconds, Config.default.pollIntervalSeconds)
+        XCTAssertEqual(cfg.rules, Config.default.rules)
+    }
+
+    func testPausedHotReloadFlipsAndFiresOnChange() {
+        let path = configPath()
+        let store = ConfigStore(path: path, logger: logger)
+        _ = store.load()
+        var changes: [Config] = []
+        store.startWatching { changes.append($0) }
+
+        write(#"{ "paused": true }"#, to: path)
+        store.reloadNow()
+        XCTAssertTrue(store.current.paused)
+        XCTAssertEqual(changes.last?.paused, true)
+
+        write(#"{ "paused": false }"#, to: path)
+        store.reloadNow()
+        XCTAssertFalse(store.current.paused)
+        XCTAssertEqual(changes.last?.paused, false)
+        store.stopWatching()
+    }
+
+    func testDefaultConfigTextRoundTripsWithPausedFalse() {
+        // The first-run default file mentions paused and round-trips to Config.default.
+        XCTAssertTrue(ConfigStore.defaultConfigText.contains("paused"))
+        let path = configPath()
+        _ = ConfigStore(path: path, logger: logger).load()  // writes default
+        let reloaded = ConfigStore(path: path, logger: logger).load()
+        XCTAssertEqual(reloaded, Config.default)
+        XCTAssertFalse(reloaded.paused)
+    }
+
     func testUnknownKeysIgnored() {
         let path = configPath()
         write(#"{ "pollIntervalSeconds": 12, "totallyMadeUpKey": 99, "nested": { "x": 1 } }"#, to: path)
@@ -220,6 +269,44 @@ final class ConfigStoreTests: XCTestCase {
         XCTAssertEqual(readBack?.records.first?.flaggedRule, .ownerlessNoIDE)
         let writtenAt = try XCTUnwrap(readBack).writtenAt.timeIntervalSince1970
         XCTAssertEqual(writtenAt, snapshot.writtenAt.timeIntervalSince1970, accuracy: 1)
+    }
+
+    func testStateSnapshotPausedHeartbeatRoundTrips() throws {
+        // SPEC-UI §7.1: paused heartbeat distinguishes paused-alive from dead.
+        let statePath = tmpDir.appendingPathComponent("state-paused.json").path
+        let store = StateStore(path: statePath, logger: logger)
+        let snapshot = AgentStateSnapshot(
+            writtenAt: Date(timeIntervalSince1970: 1_700_000_200),
+            agentPid: 777,
+            lastPollAt: Date(timeIntervalSince1970: 1_700_000_150),
+            ideRunning: false,
+            notificationsAuthorized: true,
+            configPath: configPath(),
+            records: [],
+            paused: true)
+        store.write(snapshot)
+        let readBack = try XCTUnwrap(store.read())
+        XCTAssertTrue(readBack.paused, "paused field must survive the round-trip")
+        XCTAssertEqual(readBack.agentPid, 777)
+    }
+
+    func testV1StateJsonDecodesAsNotPaused() throws {
+        // A state.json written by a v1 agent has no `paused` key → reads false.
+        let statePath = tmpDir.appendingPathComponent("v1-state.json").path
+        write(#"""
+        {
+          "writtenAt": "2024-01-01T00:00:00Z",
+          "agentPid": 42,
+          "lastPollAt": "2024-01-01T00:00:00Z",
+          "ideRunning": false,
+          "configPath": "/tmp/c.json",
+          "records": []
+        }
+        """#, to: statePath)
+        let store = StateStore(path: statePath, logger: logger)
+        let readBack = try XCTUnwrap(store.read())
+        XCTAssertFalse(readBack.paused, "v1 state.json (no paused key) → not paused")
+        XCTAssertEqual(readBack.agentPid, 42)
     }
 
     func testStateStoreMissingFileReturnsNil() {

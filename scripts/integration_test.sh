@@ -216,6 +216,7 @@ write_config() {
   local prefixes="${PREFIXES:-[\"dev.invalid.nonexistent\"]}"
   local poll="${POLL:-2}" idlepoll="${IDLEPOLL:-2}"
   local snooze="${SNOOZE:-0.05}" escalation="${ESCALATION:-2}"
+  local paused="${PAUSED:-false}"
   cat > "$TMP/config.json" <<EOF
 {
   "pollIntervalSeconds": $poll,
@@ -231,7 +232,8 @@ write_config() {
   "killEscalationSeconds": $escalation,
   "autoKill": { "enabled": $ak_enabled, "rules": $ak_rules },
   "ownerAppBundlePrefixes": $prefixes,
-  "logLevel": "debug"
+  "logLevel": "debug",
+  "paused": $paused
 }
 EOF
 }
@@ -249,7 +251,7 @@ new_scenario() {
   # Reset overridable knobs.
   unset R1_ENABLED R1_THR R2_ENABLED R2_THR R3_ENABLED R3_THR \
         R4_ENABLED R4_THR R4_CPU AK_ENABLED AK_RULES PREFIXES \
-        POLL IDLEPOLL SNOOZE ESCALATION
+        POLL IDLEPOLL SNOOZE ESCALATION PAUSED
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -651,6 +653,102 @@ scenario_s10() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# S11 — KillPolicy split (SPEC-UI §6/§13): an OWNED fakedaemon (gradle --listen +
+# a connected plain client). The hidden debug hook `--kill-pid <pid> --policy …`
+# is the ONLY way to drive a userForced kill (the agent poll loop cannot). Expect:
+# respectOwnership REFUSES (process survives, "refused"); userForced KILLS it.
+# No agent is needed here — the hook does its own fresh scan + resolve + kill.
+# ─────────────────────────────────────────────────────────────────────────────
+scenario_s11() {
+  new_scenario
+  echo "S11: KillPolicy — userForced kills an owned daemon, respectOwnership refuses"
+  write_config   # config only used for killEscalationSeconds / prefixes
+  local gtok="s11g-$$"
+  read -r gpid gport <<<"$(spawn_listener_fake "$gtok" 1 "$GRADLE_MARKER" 8.13 --exit-after 120)"
+  if [ -z "$gpid" ] || [ -z "$gport" ]; then record "S11 KillPolicy" FAIL "listener gradle didn't start"; return; fi
+  info "fake gradle pid=$gpid listening on $gport"
+  local ctok="s11c-$$"
+  local cpid; cpid="$(spawn_child_fake "$ctok" --connect "$gport" --exit-after 120)"
+  info "plain client pid=$cpid connected → gradle is OWNED (O2)"
+  # Let the connection establish so the resolver sees the attached client.
+  sleep 3
+
+  # respectOwnership → must REFUSE the owned daemon and leave it alive.
+  local out rc
+  out="$("$DS" --kill-pid "$gpid" --policy respectOwnership \
+        --config "$TMP/config.json" --log-file "$TMP/kill1.log" 2>/dev/null)"; rc=$?
+  info "respectOwnership: rc=$rc out=\"$out\""
+  if ! is_alive "$gpid"; then
+    record "S11 KillPolicy" FAIL "respectOwnership killed an owned daemon (should refuse)"; return
+  fi
+  if ! echo "$out" | grep -qi "refused\|owned"; then
+    record "S11 KillPolicy" FAIL "respectOwnership did not report a refusal: $out"; return
+  fi
+  info "respectOwnership refused; daemon still alive (correct)"
+
+  # userForced → must KILL the same owned daemon.
+  out="$("$DS" --kill-pid "$gpid" --policy userForced \
+        --config "$TMP/config.json" --log-file "$TMP/kill2.log" 2>/dev/null)"; rc=$?
+  info "userForced: rc=$rc out=\"$out\""
+  if ! echo "$out" | grep -qi "killed"; then
+    record "S11 KillPolicy" FAIL "userForced did not report a kill: $out"; return
+  fi
+  if ! wait_for_death "$gpid" 10; then
+    record "S11 KillPolicy" FAIL "userForced did not actually kill the owned daemon"; return
+  fi
+  info "userForced killed the owned daemon (correct)"
+  record "S11 KillPolicy" PASS
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# S12 — Paused agent (SPEC-UI §7.1/§13): with paused=true a flaggable fakedaemon
+# is NOT flagged, yet the state.json heartbeat keeps updating with paused=true.
+# Flip paused=false (hot reload) → the flag fires. Proves the gate suspends poll
+# work without killing the heartbeat, and resume re-arms detection.
+# ─────────────────────────────────────────────────────────────────────────────
+scenario_s12() {
+  new_scenario
+  echo "S12: paused agent — no flags while paused, heartbeat alive, resume flags"
+  R1_THR=0.1
+  PAUSED=true
+  write_config
+  start_agent
+  local tok="s12-$$"
+  local pid; pid="$(spawn_detached_fake "$tok" "$GRADLE_MARKER" 8.13 --exit-after 120)"
+  if [ -z "$pid" ]; then record "S12 paused" FAIL "fake didn't spawn"; return; fi
+  info "detached fake gradle pid=$pid (agent is PAUSED)"
+
+  # Phase 1: while paused, NO flag for ≥15s (~well past the 0.1-min threshold).
+  if ! assert_absent_for "flagging" 15 "$TMP/agent.log"; then
+    record "S12 paused" FAIL "flagged while paused (gate failed)"; return
+  fi
+  info "no flag for 15s while paused (correct)"
+
+  # Heartbeat: state.json keeps updating with paused=true. Capture writtenAt twice.
+  if [ ! -f "$TMP/state.json" ]; then record "S12 paused" FAIL "no state.json heartbeat"; return; fi
+  if ! grep -q '"paused" : true' "$TMP/state.json" && ! grep -q '"paused":true' "$TMP/state.json"; then
+    record "S12 paused" FAIL "state.json missing paused=true"; return
+  fi
+  local w1; w1="$(grep -o '"writtenAt"[^,]*' "$TMP/state.json" | head -1)"
+  sleep 4
+  local w2; w2="$(grep -o '"writtenAt"[^,]*' "$TMP/state.json" | head -1)"
+  if [ "$w1" = "$w2" ]; then
+    record "S12 paused" FAIL "heartbeat stalled while paused (writtenAt unchanged)"; return
+  fi
+  info "heartbeat advancing with paused=true ($w1 → $w2)"
+
+  # Phase 2: resume (paused=false via hot reload) → flag must fire.
+  PAUSED=false R1_THR=0.1
+  write_config
+  info "flipped paused=false; expecting a flag now"
+  if ! wait_for_log "flagging.*$pid|$pid .* via R1" "$TMP/agent.log" 20; then
+    record "S12 paused" FAIL "no flag within 20s of resume"; return
+  fi
+  info "$(grep -E "flagging" "$TMP/agent.log" | head -1)"
+  record "S12 paused" PASS
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Run all scenarios
 # ─────────────────────────────────────────────────────────────────────────────
 scenario_s1
@@ -663,6 +761,8 @@ scenario_s7
 scenario_s8
 scenario_s9
 scenario_s10
+scenario_s11
+scenario_s12
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Summary

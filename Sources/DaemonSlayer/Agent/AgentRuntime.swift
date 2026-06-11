@@ -105,13 +105,30 @@ final class AgentRuntime {
     // MARK: - Poll cycle
 
     private func poll() {
+        // Paused (SPEC-UI §7.1): suspend ALL poll work — no scan, no lsof, no
+        // notifications, no kills (incl. auto-kill). In-memory hysteresis/snooze
+        // state is neither cleared nor advanced (no ingest runs → counters, which
+        // count polls, are frozen). We still write a heartbeat so a reader can tell
+        // paused-alive from dead, and keep the timer on the idle cadence WITHOUT a
+        // phase reset (same guarantee config hot-reload gives, see apply()).
+        if config.paused {
+            writeState()
+            if config.idlePollIntervalSeconds != currentInterval {
+                scheduleTimer(interval: config.idlePollIntervalSeconds)
+            }
+            return
+        }
+
         let now = Date()
         let raw = scanner.allProcesses()
         let daemons = ProcessScanner.daemons(in: raw)
         let snapshot = resolver.resolve(daemons: daemons, allProcesses: raw,
                                         idePids: ideMonitor.runningIDEPids(),
                                         ideRunning: ideMonitor.ideRunning,
-                                        timestamp: now)
+                                        timestamp: now,
+                                        // Headless poll path: never pay for the UI-only
+                                        // client-name lsof (the engine ignores the fact).
+                                        resolveClientDescriptions: false)
         lastPollAt = now
         lastIDERunning = snapshot.ideRunning
 
@@ -142,12 +159,16 @@ final class AgentRuntime {
         return resolver.resolve(daemons: daemons, allProcesses: raw,
                                 idePids: ideMonitor.runningIDEPids(),
                                 ideRunning: ideMonitor.ideRunning,
-                                timestamp: Date())
+                                timestamp: Date(),
+                                // Kill-time re-validation only needs ownership facts.
+                                resolveClientDescriptions: false)
     }
 
     private func performKill(_ procs: [FlaggedProcess], userInitiated: Bool) {
         if userInitiated { engine.markKilling(procs.map(\.process.identity)) }
-        killer.kill(procs) { [weak self] reports in
+        // The agent ALWAYS respects ownership (SPEC-UI §6): neither the auto-kill
+        // path nor the notification action may ever construct `.userForced`.
+        killer.kill(procs, policy: .respectOwnership) { [weak self] reports in
             guard let self else { return }
             self.pollQueue.async {
                 // Anything not actually killed returns to normal evaluation.
@@ -197,7 +218,8 @@ final class AgentRuntime {
             ideRunning: lastIDERunning,
             notificationsAuthorized: notifier.authorized,
             configPath: configStore.path,
-            records: engine.stateRecords()
+            records: engine.stateRecords(),
+            paused: config.paused
         ))
     }
 }

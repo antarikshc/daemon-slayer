@@ -28,8 +28,14 @@ final class OwnershipResolver {
         let peerPort: Int
     }
 
+    /// `resolveClientDescriptions` has NO default (matching the KillPolicy
+    /// no-default pattern) so every call site must state intent. When false, the
+    /// display-only client-naming lsof pass never spawns and
+    /// `attachedClientDescription` stays nil — the headless agent passes false so
+    /// it never pays for a UI-only fact in its hot path; --status/UI pass true.
     func resolve(daemons: [DaemonProcess], allProcesses: [RawProcess],
-                 idePids: Set<Int32>, ideRunning: Bool, timestamp: Date) -> PollSnapshot {
+                 idePids: Set<Int32>, ideRunning: Bool, timestamp: Date,
+                 resolveClientDescriptions: Bool) -> PollSnapshot {
         // Zero daemons → skip the spawn entirely (spec edge case 10, fast path).
         guard !daemons.isEmpty else {
             return PollSnapshot(timestamp: timestamp, daemons: [], ideRunning: ideRunning)
@@ -41,6 +47,23 @@ final class OwnershipResolver {
 
         // O2/O4 — one lsof for ALL daemon pids.
         let lsof = runLsof(for: daemons.map { $0.pid })
+
+        // v2 (SPEC-UI §5.1) — display-only client identification, OPT-IN only.
+        // The headless agent passes resolveClientDescriptions=false so this second
+        // lsof never spawns in its poll hot path (the engine ignores the fact);
+        // only --status/UI opt in. Even when opted in, collect every non-peer-daemon
+        // candidate peer port across all daemons, resolve those ports → owning pid
+        // with ONE extra targeted lsof, then pid → process name via the scanner's
+        // process table — skipped entirely (no spawn) when there are no non-peer
+        // clients, so an all-peer / clientless poll costs nothing.
+        var peerPidByPort: [Int: Int32] = [:]
+        if resolveClientDescriptions, let lsof = lsof {
+            let clientPorts = nonPeerClientPeerPorts(daemons: daemons, lsof: lsof, watched: watchedPids)
+            if !clientPorts.isEmpty {
+                peerPidByPort = runLsofPortOwners(ports: clientPorts)
+            }
+        }
+        let nameByPid = processNameByPid(allProcesses)
 
         var observations: [DaemonObservation] = []
         observations.reserveCapacity(daemons.count)
@@ -70,11 +93,24 @@ final class OwnershipResolver {
             // O2 — inbound candidate = ESTABLISHED loopback row whose LOCAL port
             // is one of this daemon's LISTEN ports.
             let candidates = myConns.filter { listen.contains($0.localPort) }
-            // hasAttachedClient iff at least one candidate has NO mirror on
-            // another watched daemon (peer-daemon links don't count, §5.1 O2).
-            let hasClient = candidates.contains { cand in
+            // Non-peer candidates = real clients (peer-daemon links excluded, §5.1 O2).
+            let clientCandidates = candidates.filter { cand in
                 !hasMirror(of: cand, in: lsof.connections, watched: watchedPids)
             }
+            let hasClient = !clientCandidates.isEmpty
+
+            // v2 (SPEC-UI §5.1) — display-only: name the attached client from the
+            // first non-peer candidate's peer port. Peer-daemon links never reach
+            // here (a peer daemon is not a client). nil if the peer pid/name can't
+            // be resolved — purely cosmetic, never affects ownership.
+            let clientDescription: String? = clientCandidates
+                .lazy
+                .compactMap { cand -> String? in
+                    guard let peerPid = peerPidByPort[cand.peerPort] else { return nil }
+                    if let name = nameByPid[peerPid] { return "\(name) (pid \(peerPid))" }
+                    return "pid \(peerPid)"
+                }
+                .first
 
             // O4 input — linkedGradlePid for Kotlin daemons only.
             let linked: Int32? = daemon.kind == .kotlin
@@ -90,7 +126,8 @@ final class OwnershipResolver {
                 hasAttachedClient: hasClient,
                 listenPorts: listen.sorted(),
                 linkedGradlePid: linked,
-                ownershipUnknown: false))
+                ownershipUnknown: false,
+                attachedClientDescription: clientDescription))
         }
 
         return PollSnapshot(timestamp: timestamp, daemons: observations, ideRunning: ideRunning)
@@ -160,6 +197,140 @@ final class OwnershipResolver {
             }
         }
         return nil
+    }
+
+    // MARK: - v2 client identification (SPEC-UI §5.1, display-only facts)
+
+    /// Peer ports of every non-peer-daemon candidate connection, across all
+    /// daemons. These belong to real clients we want to name; peer-daemon links
+    /// (which have a mirror on another watched daemon) are excluded.
+    private func nonPeerClientPeerPorts(daemons: [DaemonProcess], lsof: LsofResult,
+                                        watched: Set<Int32>) -> Set<Int> {
+        var ports: Set<Int> = []
+        for daemon in daemons {
+            let listen = lsof.listenPorts[daemon.pid] ?? []
+            let myConns = lsof.connections.filter { $0.pid == daemon.pid }
+            for cand in myConns where listen.contains(cand.localPort) {
+                if !hasMirror(of: cand, in: lsof.connections, watched: watched) {
+                    ports.insert(cand.peerPort)
+                }
+            }
+        }
+        return ports
+    }
+
+    /// pid → process name (argv[0] basename) from the scanner's process table.
+    /// Empty-argv rows (zombies/EPERM) are skipped — they have no name to show.
+    private func processNameByPid(_ procs: [RawProcess]) -> [Int32: String] {
+        var map: [Int32: String] = [:]
+        map.reserveCapacity(procs.count)
+        for p in procs {
+            guard let arg0 = p.argv.first, !arg0.isEmpty else { continue }
+            map[p.pid] = (arg0 as NSString).lastPathComponent
+        }
+        return map
+    }
+
+    /// One extra targeted lsof to map loopback TCP `ports` → owning pid. Used only
+    /// for display-side client identification (SPEC-UI §5.1); failure/timeout is
+    /// non-fatal (returns what was parsed, possibly empty) since this never affects
+    /// ownership. We query the union of ports with `-iTCP:p1,p2,…` so it's one spawn.
+    ///
+    /// NOTE: unlike runLsof (whose failure ⇒ ownershipUnknown ⇒ fail-CLOSED, never
+    /// flag/kill), failure here is deliberately fail-SOFT: this lookup is display-only,
+    /// so a spawn error/timeout just leaves the client name nil. Do NOT "harden" this
+    /// into returning nil-the-snapshot or otherwise blocking — that would make a
+    /// cosmetic UI fact gate ownership, which it must never do.
+    private func runLsofPortOwners(ports: Set<Int>) -> [Int: Int32] {
+        guard !ports.isEmpty else { return [:] }
+        let portArg = ports.sorted().map(String.init).joined(separator: ",")
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: Self.lsofPath)
+        // LISTEN/local rows for these ports → the owning pid. -F pn gives pid + name
+        // (host:port); we map a process's LOCAL port (its listen/bound port) to its pid.
+        proc.arguments = ["-a", "-i", "TCP:\(portArg)", "-n", "-P", "-F", "pnT"]
+
+        let stdout = Pipe()
+        let stderr = Pipe()
+        proc.standardOutput = stdout
+        proc.standardError = stderr
+
+        var stdoutData = Data()
+        let drainQueue = DispatchQueue(label: "dev.antariksh.daemonslayer.lsof.owners.drain")
+        let drainGroup = DispatchGroup()
+
+        do {
+            try proc.run()
+        } catch {
+            logger.debug("OwnershipResolver: client-owner lsof spawn failed: \(error.localizedDescription)")
+            return [:]
+        }
+        drainGroup.enter()
+        drainQueue.async {
+            stdoutData = stdout.fileHandleForReading.readDataToEndOfFile()
+            drainGroup.leave()
+        }
+        let done = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async { proc.waitUntilExit(); done.signal() }
+        if done.wait(timeout: .now() + lsofTimeoutSeconds) == .timedOut {
+            kill(proc.processIdentifier, SIGKILL)
+            _ = done.wait(timeout: .now() + 1)
+            _ = drainGroup.wait(timeout: .now() + 1)
+            logger.debug("OwnershipResolver: client-owner lsof timed out; client names unresolved this cycle")
+            return [:]
+        }
+        _ = drainGroup.wait(timeout: .now() + 1)
+        _ = stderr.fileHandleForReading.readDataToEndOfFile()
+        let output = String(data: stdoutData, encoding: .utf8) ?? ""
+        return parsePortOwners(output, wanted: ports)
+    }
+
+    /// Parse `-F pnT` output mapping a connection's LOCAL port → its owning pid.
+    /// A client process has a connection whose LOCAL port is the peer port we want.
+    /// We map both LISTEN and ESTABLISHED local ports so either kind of owner is found.
+    private func parsePortOwners(_ output: String, wanted: Set<Int>) -> [Int: Int32] {
+        var map: [Int: Int32] = [:]
+        var curPid: Int32?
+        var curName: String?
+
+        func record() {
+            guard let pid = curPid, let name = curName else { return }
+            // LISTEN rows: "host:port". ESTABLISHED rows: "local->peer". For a
+            // client, its LOCAL endpoint port is the daemon's peer port — take the
+            // local side in both shapes.
+            let localSide: Substring
+            if let arrow = name.range(of: "->") {
+                localSide = name[name.startIndex..<arrow.lowerBound]
+            } else {
+                localSide = name[...]
+            }
+            if let (_, port) = splitHostPort(localSide), wanted.contains(port) {
+                // A local TCP port has exactly one owning pid at a time, so the
+                // first row that names it is authoritative (one owner can hold many
+                // ports — the map is port→pid, not pid→port).
+                map[port] = pid
+            }
+            curName = nil
+        }
+
+        for rawLine in output.split(separator: "\n", omittingEmptySubsequences: true) {
+            guard let tag = rawLine.first else { continue }
+            let value = rawLine.dropFirst()
+            switch tag {
+            case "p":
+                record()
+                curPid = Int32(value)
+                curName = nil
+            case "f":
+                record()
+            case "n":
+                curName = String(value)
+            default:
+                break
+            }
+        }
+        record()
+        return map
     }
 
     // MARK: - lsof spawn + field-mode parse

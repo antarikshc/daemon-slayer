@@ -11,6 +11,11 @@ enum DSPaths {
 
 enum CLIMode: Equatable {
     case agent, status, scanOnce, version, help
+    /// Hidden test/debug entry point (NOT shown in --help): one-shot kill of a
+    /// single pid under an explicit policy. This is the ONLY place `.userForced`
+    /// can originate; the agent poll loop has no path to it. Used by the
+    /// integration harness to exercise the KillPolicy split against real fakes.
+    case killPid(Int32, KillPolicy)
 }
 
 struct CLIError: Error {
@@ -27,6 +32,10 @@ struct CLIOptions {
     static func parse(_ args: [String]) -> Result<CLIOptions, CLIError> {
         var opts = CLIOptions()
         var i = 1
+        // Hidden test/debug kill hook (see CLIMode.killPid). Collected here, folded
+        // into the mode after the full arg scan so flag order doesn't matter.
+        var killPidArg: Int32?
+        var policyArg: KillPolicy?
         func value(for flag: String) -> String? {
             i += 1
             return i < args.count ? args[i] : nil
@@ -39,6 +48,20 @@ struct CLIOptions {
             case "--scan-once": opts.mode = .scanOnce
             case "--version": opts.mode = .version
             case "--help", "-h": opts.mode = .help
+            case "--kill-pid":
+                guard let v = value(for: arg), let pid = Int32(v) else {
+                    return .failure(CLIError(message: "--kill-pid requires a numeric pid"))
+                }
+                killPidArg = pid
+            case "--policy":
+                guard let v = value(for: arg) else {
+                    return .failure(CLIError(message: "--policy requires a value (respectOwnership|userForced)"))
+                }
+                switch v {
+                case "respectOwnership": policyArg = .respectOwnership
+                case "userForced": policyArg = .userForced
+                default: return .failure(CLIError(message: "--policy must be respectOwnership or userForced"))
+                }
             case "--config":
                 guard let v = value(for: arg) else { return .failure(CLIError(message: "--config requires a path")) }
                 opts.configPath = v
@@ -52,6 +75,15 @@ struct CLIOptions {
                 return .failure(CLIError(message: "unknown argument: \(arg)"))
             }
             i += 1
+        }
+        // Fold the hidden kill hook into the mode (requires both flags).
+        if let pid = killPidArg {
+            guard let policy = policyArg else {
+                return .failure(CLIError(message: "--kill-pid requires --policy <respectOwnership|userForced>"))
+            }
+            opts.mode = .killPid(pid, policy)
+        } else if policyArg != nil {
+            return .failure(CLIError(message: "--policy is only valid with --kill-pid"))
         }
         return .success(opts)
     }

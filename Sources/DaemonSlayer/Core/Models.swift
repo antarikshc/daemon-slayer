@@ -89,19 +89,26 @@ struct DaemonObservation: Codable {
     /// lsof timed out/failed for this daemon this cycle → RuleEngine keeps the
     /// previous verdict (fail-safe toward NOT flagging, spec edge case 8).
     var ownershipUnknown: Bool
+    /// v2 (SPEC-UI §5.1): display-only description of the attached client (the
+    /// non-peer ESTABLISHED loopback peer process, e.g. "Android Studio", "java
+    /// (pid 1234)"). Facts only — the RuleEngine IGNORES this. nil when there is
+    /// no client (or only peer-daemon links, which are not clients).
+    var attachedClientDescription: String?
 
     init(process: DaemonProcess,
          parentIsIDE: Bool = false,
          hasAttachedClient: Bool = false,
          listenPorts: [Int] = [],
          linkedGradlePid: Int32? = nil,
-         ownershipUnknown: Bool = false) {
+         ownershipUnknown: Bool = false,
+         attachedClientDescription: String? = nil) {
         self.process = process
         self.parentIsIDE = parentIsIDE
         self.hasAttachedClient = hasAttachedClient
         self.listenPorts = listenPorts
         self.linkedGradlePid = linkedGradlePid
         self.ownershipUnknown = ownershipUnknown
+        self.attachedClientDescription = attachedClientDescription
     }
 }
 
@@ -201,6 +208,18 @@ struct ProcessStateRecord: Codable {
     var snoozedUntil: Date?
     var lastSeen: Date
     var rssBytes: UInt64
+}
+
+// MARK: - Kill policy (SPEC-UI §6)
+
+/// Whether a kill batch honors the kill-time ownership re-check (v1 default) or
+/// bypasses ONLY that one check on explicit user intent. Identity, argv, and
+/// per-phase start-time re-verification are non-negotiable under both policies —
+/// a recycled PID is unkillable regardless. The parameter has NO default so every
+/// call site states its policy; no agent path may ever construct `.userForced`.
+enum KillPolicy: Equatable {
+    case respectOwnership   // v1 behaviour — the ONLY policy the agent may use.
+    case userForced         // UI-only, behind an explicit confirmation dialog.
 }
 
 // MARK: - Kill reporting (spec §7)

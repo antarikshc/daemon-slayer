@@ -10,6 +10,25 @@ struct KillerDependencies {
     /// nil means the scan FAILED → the whole batch is aborted (fail-safe: we
     /// never signal a process we could not re-validate against current truth).
     var freshSnapshot: () -> PollSnapshot?
+
+    // The following are injectable purely for unit-testing the kill machinery
+    // against fakes (no real processes/signals). Production wiring leaves them at
+    // their defaults, which are the exact Darwin syscalls the killer always used.
+
+    /// Send `signal` to `pid`. Default: `Darwin.kill`. Returns 0 on success, else
+    /// sets errno (the production path inspects errno for ESRCH/EPERM).
+    var sendSignal: (Int32, Int32) -> Int32 = { Darwin.kill($0, $1) }
+    /// Live start-time probe (proc_pidinfo PROC_PIDTBSDINFO) — same source/formula
+    /// the scanner uses. nil = process gone. Default reads the live process table.
+    var liveStartMicros: (Int32) -> Int64? = { pid in
+        var info = proc_bsdinfo()
+        let size = Int32(MemoryLayout<proc_bsdinfo>.size)
+        let n = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size)
+        guard n == size else { return nil }
+        return Int64(info.pbi_start_tvsec) * 1_000_000 + Int64(info.pbi_start_tvusec)
+    }
+    /// Unlink a path. Default: `Darwin.unlink`. (Errno semantics preserved.)
+    var unlinkPath: (String) -> Int32 = { Darwin.unlink($0) }
 }
 
 // MARK: - Killer (SAFETY-CRITICAL — spec §7, goal #4 "never kill an active build")
@@ -40,16 +59,19 @@ final class Killer {
     }
 
     /// Async, never blocks the caller; `completion` runs on an arbitrary queue.
-    func kill(_ targets: [FlaggedProcess], completion: @escaping ([KillReport]) -> Void) {
+    /// `policy` is required (no default) so every call site states its intent
+    /// (SPEC-UI §6): the agent must always pass `.respectOwnership`.
+    func kill(_ targets: [FlaggedProcess], policy: KillPolicy,
+              completion: @escaping ([KillReport]) -> Void) {
         queue.async { [weak self] in
             guard let self = self else { completion([]); return }
-            completion(self.run(targets))
+            completion(self.run(targets, policy: policy))
         }
     }
 
     // MARK: - Batch driver
 
-    private func run(_ targets: [FlaggedProcess]) -> [KillReport] {
+    private func run(_ targets: [FlaggedProcess], policy: KillPolicy) -> [KillReport] {
         guard !targets.isEmpty else { return [] }
 
         let escalation = max(0.1, deps.escalationSeconds())
@@ -73,7 +95,7 @@ final class Killer {
                 logger.error("kill aborted — phase-1 (kotlin) revalidation scan failed; signalling nothing (fail-safe)")
                 return targets.map { KillReport(target: $0, outcome: .failed("revalidation scan failed")) }
             }
-            reports.append(contentsOf: resolvePhase(kotlin, snapshot: snapshot, escalation: escalation, phase2: false))
+            reports.append(contentsOf: resolvePhase(kotlin, snapshot: snapshot, escalation: escalation, phase2: false, policy: policy))
         }
 
         // Phase 2 — Gradle daemons. A SECOND fresh snapshot taken AFTER the kotlin
@@ -86,7 +108,7 @@ final class Killer {
                 reports.append(contentsOf: gradle.map { KillReport(target: $0, outcome: .failed("revalidation scan failed")) })
                 return reports
             }
-            reports.append(contentsOf: resolvePhase(gradle, snapshot: snapshot, escalation: escalation, phase2: true))
+            reports.append(contentsOf: resolvePhase(gradle, snapshot: snapshot, escalation: escalation, phase2: true, policy: policy))
         }
 
         return reports
@@ -97,7 +119,8 @@ final class Killer {
     private func resolvePhase(_ targets: [FlaggedProcess],
                               snapshot: PollSnapshot,
                               escalation: Double,
-                              phase2: Bool) -> [KillReport] {
+                              phase2: Bool,
+                              policy: KillPolicy) -> [KillReport] {
         guard !targets.isEmpty else { return [] }
 
         let group = DispatchGroup()
@@ -109,7 +132,7 @@ final class Killer {
             workers.async { [weak self] in
                 defer { group.leave() }
                 guard let self = self else { return }
-                let report = self.resolveOne(target, snapshot: snapshot, escalation: escalation, phase2: phase2)
+                let report = self.resolveOne(target, snapshot: snapshot, escalation: escalation, phase2: phase2, policy: policy)
                 lock.lock(); results[i] = report; lock.unlock()
             }
         }
@@ -129,14 +152,16 @@ final class Killer {
     private func resolveOne(_ target: FlaggedProcess,
                             snapshot: PollSnapshot,
                             escalation: Double,
-                            phase2: Bool) -> KillReport {
+                            phase2: Bool,
+                            policy: KillPolicy) -> KillReport {
         let proc = target.process
         let pid = proc.pid
 
         // (3) Re-validate EVERY target against the fresh snapshot before any
         // signal. A daemon that picked up a new build or owner since the
-        // notification must be skipped (spec §7, goal #4).
-        switch revalidate(target, in: snapshot, phase2: phase2) {
+        // notification must be skipped (spec §7, goal #4) — unless `.userForced`,
+        // which bypasses EXACTLY the ownership step (identity/argv still gate).
+        switch revalidate(target, in: snapshot, phase2: phase2, policy: policy) {
         case .skip(let outcome):
             return KillReport(target: target, outcome: outcome)
         case .proceed:
@@ -183,11 +208,13 @@ final class Killer {
         case skip(KillOutcome)
     }
 
-    private func revalidate(_ target: FlaggedProcess, in snapshot: PollSnapshot, phase2: Bool) -> Revalidation {
+    private func revalidate(_ target: FlaggedProcess, in snapshot: PollSnapshot,
+                            phase2: Bool, policy: KillPolicy) -> Revalidation {
         let proc = target.process
         let pid = proc.pid
 
         // (a) An observation with the SAME pid AND SAME startTimeMicros exists.
+        // Holds under EVERY policy — a recycled PID is unkillable (SPEC-UI §6).
         guard let obs = snapshot.daemons.first(where: {
             $0.process.pid == pid && $0.process.identity.startTimeMicros == proc.identity.startTimeMicros
         }) else {
@@ -197,14 +224,19 @@ final class Killer {
         }
 
         // (b) Its argv still contains the matching daemon marker for its kind
-        // (exact element match, spec §5.4).
+        // (exact element match, spec §5.4). Holds under every policy.
         let marker = (proc.kind == .gradle) ? DaemonKind.gradleArgvMarker : DaemonKind.kotlinArgvMarker
         guard obs.process.argv.contains(marker) else {
             logger.info("skipped pid \(pid) (\(proc.displayName)) — argv no longer matches a \(proc.kind.rawValue) (re-execed?)")
             return .skip(.skippedGone)
         }
 
-        // (c) Ownership re-check. lsof unknown → fail-safe toward "owned".
+        // (c) Ownership re-check — the ONLY step `.userForced` bypasses (SPEC-UI
+        // §6): user intent already confirmed killing an owned/busy daemon, so a
+        // now-owned verdict (or ownershipUnknown fail-safe) does not skip it.
+        if policy == .userForced { return .proceed }
+
+        // lsof unknown → fail-safe toward "owned".
         if obs.ownershipUnknown {
             logger.info("skipped pid \(pid) (\(proc.displayName)) — ownership unknown this cycle (fail-safe, not killed)")
             return .skip(.skippedNowOwned)
@@ -239,7 +271,7 @@ final class Killer {
         logger.info("killing pid \(pid) (\(name)) via marker-file shutdown — unlinking \(markerPath)")
         // unlink errors (already gone, permission) are non-fatal: fall through to
         // signal escalation, which is authoritative.
-        if unlink(markerPath) != 0 && errno != ENOENT {
+        if deps.unlinkPath(markerPath) != 0 && errno != ENOENT {
             logger.warn("pid \(pid) (\(name)) — unlink of marker failed (errno \(errno)); falling back to signals")
         }
 
@@ -271,19 +303,20 @@ final class Killer {
         let pid = proc.pid
 
         // Re-verify start time immediately before signalling (spec §7 #5, §12).
-        switch liveStartMicros(pid: pid) {
-        case .gone:
+        // Holds under EVERY policy — a recycled PID is never signalled.
+        switch deps.liveStartMicros(pid) {
+        case .none:
             logger.info("skipped pid \(pid) (\(proc.displayName)) — gone before \(method)")
             return .resolved(.skippedGone)
-        case .micros(let live) where live != proc.identity.startTimeMicros:
+        case .some(let live) where live != proc.identity.startTimeMicros:
             logger.info("skipped pid \(pid) (\(proc.displayName)) — start time changed before \(method) (PID reused mid-escalation)")
             return .resolved(.skippedGone)
-        case .micros:
+        case .some:
             break
         }
 
         logger.info("killing pid \(pid) (\(proc.displayName)) via \(method)")
-        if Darwin.kill(pid, signal) != 0 {
+        if deps.sendSignal(pid, signal) != 0 {
             // ESRCH at signal time → it just exited; EPERM → genuine failure.
             switch errno {
             case ESRCH:
@@ -312,29 +345,16 @@ final class Killer {
     /// EPERM (process exists but not ours — shouldn't happen for same-user) is
     /// treated as "still alive".
     private func pollForExit(pid: Int32, within: TimeInterval) -> Bool {
+        // Liveness probe via signal 0 (no signal sent; only existence/perm checked),
+        // routed through the injectable sender so unit tests can model exit.
+        func exited() -> Bool { deps.sendSignal(pid, 0) == -1 && errno == ESRCH }
         let deadline = Date().addingTimeInterval(within)
         repeat {
-            if Darwin.kill(pid, 0) == -1 && errno == ESRCH { return true }
+            if exited() { return true }
             // Spin-wait via usleep on this worker thread (off the poll/main path).
             usleep(useconds_t(Self.pollStep * 1_000_000))
         } while Date() < deadline
         // Final check after the loop's last sleep.
-        return Darwin.kill(pid, 0) == -1 && errno == ESRCH
-    }
-
-    private enum StartProbe {
-        case micros(Int64)
-        case gone
-    }
-
-    /// Live start-time of `pid` via proc_pidinfo(PROC_PIDTBSDINFO) — same source
-    /// and same micros formula the scanner uses, so equality is exact.
-    private func liveStartMicros(pid: Int32) -> StartProbe {
-        var info = proc_bsdinfo()
-        let size = Int32(MemoryLayout<proc_bsdinfo>.size)
-        let n = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size)
-        guard n == size else { return .gone }
-        let micros = Int64(info.pbi_start_tvsec) * 1_000_000 + Int64(info.pbi_start_tvusec)
-        return .micros(micros)
+        return exited()
     }
 }

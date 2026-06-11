@@ -262,7 +262,10 @@ final class ConfigStore {
         "com.jetbrains.intellij"
       ],
       // Log verbosity: debug | info | warn | error.
-      "logLevel": "info"
+      "logLevel": "info",
+      // v2: when true the agent suspends all watching/notifying/killing (the v2 UI
+      // toggles this; it stays paused until flipped back).
+      "paused": false
     }
     """
 }

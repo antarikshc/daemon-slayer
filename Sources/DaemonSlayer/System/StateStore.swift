@@ -12,6 +12,36 @@ struct AgentStateSnapshot: Codable {
     var notificationsAuthorized: Bool?
     var configPath: String
     var records: [ProcessStateRecord]
+    /// v2 (SPEC-UI §7.1): true while the agent is paused. A fresh heartbeat with
+    /// paused=true lets a reader (the v2 UI banner) distinguish paused-alive from
+    /// dead. Optional/defaulted so a v1 state.json reads back as not-paused.
+    var paused: Bool = false
+
+    init(writtenAt: Date, agentPid: Int32, lastPollAt: Date, ideRunning: Bool,
+         notificationsAuthorized: Bool?, configPath: String,
+         records: [ProcessStateRecord], paused: Bool = false) {
+        self.writtenAt = writtenAt
+        self.agentPid = agentPid
+        self.lastPollAt = lastPollAt
+        self.ideRunning = ideRunning
+        self.notificationsAuthorized = notificationsAuthorized
+        self.configPath = configPath
+        self.records = records
+        self.paused = paused
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        writtenAt = try c.decode(Date.self, forKey: .writtenAt)
+        agentPid = try c.decode(Int32.self, forKey: .agentPid)
+        lastPollAt = try c.decode(Date.self, forKey: .lastPollAt)
+        ideRunning = try c.decode(Bool.self, forKey: .ideRunning)
+        notificationsAuthorized = try c.decodeIfPresent(Bool.self, forKey: .notificationsAuthorized)
+        configPath = try c.decode(String.self, forKey: .configPath)
+        records = try c.decode([ProcessStateRecord].self, forKey: .records)
+        // Optional so a v1 state.json (no `paused` key) decodes as not-paused.
+        paused = try c.decodeIfPresent(Bool.self, forKey: .paused) ?? false
+    }
 }
 
 /// Atomic reader/writer for state.json (spec §11). The file is pretty-printed with

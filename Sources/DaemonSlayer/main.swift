@@ -18,6 +18,8 @@ case .success(let options):
         exit(StatusCommand.run(options: options, includeAgentView: false))
     case .status:
         exit(StatusCommand.run(options: options, includeAgentView: true))
+    case .killPid(let pid, let policy):
+        exit(KillCommand.run(pid: pid, policy: policy, options: options))
     case .agent:
         AgentRuntime(configPath: options.configPath,
                      statePath: options.statePath,
