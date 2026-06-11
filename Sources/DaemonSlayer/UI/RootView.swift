@@ -1,22 +1,27 @@
 import SwiftUI
 
-/// The status & control window (SPEC-UI §10). M3 lands the daemon cards + kill UX:
-/// a scrollable card list, the friction-laddered kill controls (per-row, Kill
-/// Orphans, Kill All), and the post-kill toast. The banner + settings rows are
-/// still placeholders (M4). Views stay THIN — every kill decision comes from the
-/// pure `KillPlanner`; this file only renders plans and routes confirmations.
+/// The status & control window (SPEC-UI §10). M3 landed the daemon cards + kill UX;
+/// M4 adds the pinned health banner (pause/resume/start) and the settings form
+/// (auto-kill + snooze, whole-file write). Views stay THIN — every kill decision
+/// comes from the pure `KillPlanner`, banner state from `BannerDeriver`, and config
+/// serialization from `ConfigWriter`; this file only renders and routes actions.
 struct RootView: View {
     @EnvironmentObject private var model: UIModel
 
     var body: some View {
         ZStack(alignment: .bottom) {
             VStack(alignment: .leading, spacing: 0) {
-                bannerRow
+                BannerView(state: model.banner,
+                           startFailed: model.startFailed,
+                           busy: model.killInFlight,
+                           onPause: model.pause,
+                           onResume: model.resume,
+                           onStart: model.startAgent)
                 Divider()
                 DaemonSection(rows: model.rows, ownershipUnknown: model.ownershipUnknown,
                               killInFlight: model.killInFlight, model: model)
                 Divider()
-                settingsPlaceholder
+                SettingsView()
             }
             .frame(minWidth: 480, minHeight: 360)
 
@@ -32,32 +37,6 @@ struct RootView: View {
             guard newValue != nil else { return }
             DispatchQueue.main.asyncAfter(deadline: .now() + 4) { model.dismissToast() }
         }
-    }
-
-    // MARK: - Banner (placeholder text; the real banner VIEW is M4)
-
-    private var bannerRow: some View {
-        HStack {
-            Text(bannerText).font(.system(.body, design: .monospaced))
-            Spacer()
-        }
-        .padding(10)
-    }
-
-    private var bannerText: String {
-        switch model.banner {
-        case .watching(let ago): return "● Watching — last poll \(Format.duration(ago)) ago"
-        case .paused: return "● PAUSED — daemons are not being watched"
-        case .dead: return "● Agent not running"
-        }
-    }
-
-    private var settingsPlaceholder: some View {
-        HStack {
-            Text("SETTINGS").sectionHeaderStyle()
-            Spacer()
-        }
-        .padding(.horizontal, 14).padding(.vertical, 8)
     }
 }
 

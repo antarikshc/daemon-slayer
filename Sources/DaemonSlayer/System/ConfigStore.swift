@@ -228,44 +228,9 @@ final class ConfigStore {
         }
     }
 
-    /// The commented default written on first run (spec §10). Key names + defaults
-    /// match the spec schema EXACTLY; whole-line `//` comments document each field
-    /// and the four rule names. This text must round-trip through `load()`.
-    static let defaultConfigText = """
-    {
-      // How often to scan the process table, in seconds (default 30).
-      "pollIntervalSeconds": 30,
-      // Slower cadence used when no daemons are present (default 120).
-      "idlePollIntervalSeconds": 120,
-      "rules": {
-        // R1 — ownerless daemon with no IDE running at all (the headline leak).
-        "ownerlessNoIDE":   { "enabled": true, "thresholdMinutes": 2 },
-        // R2 — ownerless daemon while an IDE is running (CLI-spawned leak).
-        "ownerlessWithIDE": { "enabled": true, "thresholdMinutes": 15 },
-        // R3 — owned but idle (≈ zero CPU) for the whole window.
-        "idleTooLong":      { "enabled": true, "thresholdMinutes": 120 },
-        // R4 — runaway: no client attached but burning CPU above the threshold.
-        "runaway":          { "enabled": true, "thresholdMinutes": 2,
-                              "cpuThresholdPercent": 50 }
-      },
-      // CPU-seconds per poll below which a daemon counts as "idle" (default 0.5).
-      "idleCpuSecondsPerPoll": 0.5,
-      // Minutes to suppress re-notification after Snooze / no response (default 60).
-      "snoozeMinutes": 60,
-      // Seconds to wait between kill escalation steps: marker → TERM → KILL (default 10).
-      "killEscalationSeconds": 10,
-      // Opt-in auto-kill: only the listed rules kill without notifying first.
-      "autoKill": { "enabled": false, "rules": ["ownerlessNoIDE"] },
-      // Bundle-ID prefixes of apps that count as an IDE / owner.
-      "ownerAppBundlePrefixes": [
-        "com.google.android.studio",
-        "com.jetbrains.intellij"
-      ],
-      // Log verbosity: debug | info | warn | error.
-      "logLevel": "info",
-      // v2: when true the agent suspends all watching/notifying/killing (the v2 UI
-      // toggles this; it stays paused until flipped back).
-      "paused": false
-    }
-    """
+    /// The commented default written on first run (spec §10). This is `ConfigWriter`'s
+    /// canonical serialization of `Config.default` — the SAME template every settings
+    /// save uses (SPEC-UI §9), so the first-run file and a saved file cannot drift.
+    /// The stock `//` section comments + key layout live in `ConfigWriter.serialize`.
+    static var defaultConfigText: String { ConfigWriter.serialize(.default) }
 }

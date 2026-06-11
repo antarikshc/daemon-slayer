@@ -18,8 +18,19 @@ final class UIModel: ObservableObject {
 
     @Published private(set) var rows: [DaemonRow] = []
     @Published private(set) var banner: BannerState = .dead
+    /// Set when a [Start] kickstart fails (plist not installed) → the banner shows the
+    /// `make install` guidance. Cleared on the next successful agent heartbeat.
+    @Published private(set) var startFailed: Bool = false
     /// True when the most recent slow tick failed lsof (M3 disables Kill Orphans).
     @Published private(set) var ownershipUnknown: Bool = false
+
+    /// The latest loaded config (defaults merged). The settings form seeds from this
+    /// and every save mutates a COPY of it, so hidden keys round-trip (SPEC-UI §9).
+    /// Published so an external config edit re-seeds the form.
+    @Published private(set) var loadedConfig: Config
+    /// Bumped on every config (re)load so the settings form re-seeds. (Config is large;
+    /// a counter is a cheaper change trigger than diffing the struct in the view.)
+    @Published private(set) var settingsRevision: Int = 0
     /// Latest post-kill toast (SPEC-UI §6); nil when there is nothing to show. The
     /// view drives the auto-dismiss timer and clears it via `dismissToast()`.
     @Published private(set) var toast: KillPlanner.ToastSummary?
@@ -49,6 +60,13 @@ final class UIModel: ObservableObject {
     private var fastTimer: DispatchSourceTimer?
     private var slowTimer: DispatchSourceTimer?
     private var stateWatch: FileWatcher?
+    private var configWatch: FileWatcher?
+    /// 1 s display clock that re-derives the banner so "last poll Ns ago" ticks. Armed
+    /// only while watching (the fast lane), cancelled on hide with everything else —
+    /// no always-on timer (SPEC-UI §7.2).
+    private var displayTimer: DispatchSourceTimer?
+    /// The agent's plist label (SPEC-UI §7.2): `launchctl kickstart` target.
+    private static let agentLabel = "dev.antariksh.daemonslayer"
 
     // Lane state (mutated on `work`).
     private var sampler: FastLaneSampler
@@ -56,6 +74,9 @@ final class UIModel: ObservableObject {
     private var latestSlow: [ProcessIdentity: DaemonRowMerger.SlowFacts] = [:]
     private var latestAgent: [ProcessIdentity: DaemonRowMerger.AgentFacts] = [:]
     private var present: [(identity: ProcessIdentity, kind: DaemonKind, displayName: String)] = []
+    /// Last state.json read (work-confined) so the 1 s display timer can re-derive the
+    /// banner against a fresh `now` without re-reading the file every second.
+    private var lastAgentSnapshot: AgentStateSnapshot?
 
     private var running = false
 
@@ -66,6 +87,7 @@ final class UIModel: ObservableObject {
         self.configStore = ConfigStore(path: options.configPath, logger: logger)
         let config = configStore.load()
         self.config = config
+        self.loadedConfig = config
         self.scanner = ProcessScanner(logger: logger)
         self.resolver = OwnershipResolver(logger: logger)
         self.ideMonitor = IDEMonitor(bundlePrefixes: config.ownerAppBundlePrefixes, logger: logger)
@@ -102,6 +124,84 @@ final class UIModel: ObservableObject {
     /// Clear the toast (the view's auto-dismiss timer fires this after ~4 s).
     func dismissToast() { toast = nil }
 
+    // MARK: - Banner actions: pause / resume / start (SPEC-UI §7)
+
+    /// [Pause] / [Resume] flip the `paused` config key via the whole-file write path.
+    /// The agent applies it on its next hot-reload (≤ 1 poll). We mutate ONLY `paused`
+    /// on the latest loaded struct, so any pending settings edit is undisturbed.
+    func pause() { writeConfig { ConfigWriter.mutated($0, paused: true) } }
+    func resume() { writeConfig { ConfigWriter.mutated($0, paused: false) } }
+
+    /// [Start] kickstarts the LaunchAgent (SPEC-UI §7.2). On failure (plist not
+    /// installed) we set `startFailed` so the banner instructs `make install` — the
+    /// UI never bootstraps the plist itself.
+    func startAgent() {
+        work.async { [self] in
+            let ok = Self.kickstartAgent(logger: logger)
+            DispatchQueue.main.async { [weak self] in self?.startFailed = !ok }
+            // Re-read state.json shortly: a successful kickstart writes a heartbeat the
+            // banner picks up; agentTick clears startFailed when it goes non-dead.
+            if ok { agentTick() }
+        }
+    }
+
+    /// Run `launchctl kickstart gui/$UID/<label>`; returns true on exit code 0.
+    private static func kickstartAgent(logger: DSLogger) -> Bool {
+        let uid = getuid()
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        p.arguments = ["kickstart", "gui/\(uid)/\(agentLabel)"]
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        do {
+            try p.run()
+            p.waitUntilExit()
+            if p.terminationStatus != 0 {
+                logger.warn("[ui] launchctl kickstart failed (exit \(p.terminationStatus)) — agent likely not installed")
+            }
+            return p.terminationStatus == 0
+        } catch {
+            logger.warn("[ui] launchctl kickstart could not run: \(error)")
+            return false
+        }
+    }
+
+    // MARK: - Settings save (SPEC-UI §9)
+
+    /// Commit a settings edit. Mutates ONLY the touched key(s) on the latest loaded
+    /// struct (`autoKill.rules` and every hidden key carried through), then writes the
+    /// whole file. `nil` args leave that key untouched.
+    func saveSettings(autoKillEnabled: Bool?, snoozeMinutes: Double?) {
+        writeConfig { ConfigWriter.mutated($0, autoKillEnabled: autoKillEnabled, snoozeMinutes: snoozeMinutes) }
+    }
+
+    /// Shared whole-file write: take the latest loaded struct, apply `mutate`, validate
+    /// + atomic-write through `ConfigWriter`, and reflect the result so the form +
+    /// banner immediately match what's on disk. Runs on `work` (off the main thread).
+    private func writeConfig(_ mutate: @escaping (Config) -> Config) {
+        work.async { [self] in
+            let base = configStore.load()   // freshest on-disk struct (catches external edits)
+            let next = mutate(base)
+            switch ConfigWriter.save(next, to: options.configPath) {
+            case .success:
+                config = next
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    self.loadedConfig = next
+                    self.settingsRevision &+= 1
+                    // Reflect the paused flip in the banner without waiting for the
+                    // 1 s tick (state.json still says the old value until the agent
+                    // re-beats; but the config is authoritative for the toggle intent).
+                }
+            case .failure(let e):
+                logger.warn("[ui] config save refused: \(e)")
+                // Re-seed the form from the unchanged on-disk struct so a refused edit
+                // doesn't leave the control out of sync.
+                DispatchQueue.main.async { [weak self] in self?.settingsRevision &+= 1 }
+            }
+        }
+    }
+
     // MARK: - Lifecycle (cancel-on-hide, SPEC-UI §5/§11)
 
     /// Window became visible → arm every lane. Idempotent.
@@ -119,6 +219,8 @@ final class UIModel: ObservableObject {
         armFastTimer()
         armSlowTimer()
         armStateWatch()
+        armConfigWatch()
+        armDisplayTimer()
 
         // Immediate first pass so the window isn't blank for 2 s / 10 s.
         work.async { [self] in
@@ -137,6 +239,8 @@ final class UIModel: ObservableObject {
         fastTimer?.cancel(); fastTimer = nil
         slowTimer?.cancel(); slowTimer = nil
         stateWatch?.cancel(); stateWatch = nil
+        configWatch?.cancel(); configWatch = nil
+        displayTimer?.cancel(); displayTimer = nil
         ideMonitor.stop()
     }
 
@@ -175,7 +279,27 @@ final class UIModel: ObservableObject {
         stateWatch = FileWatcher(path: options.statePath, queue: work) { [weak self] in
             self?.agentTick()
         }
-        // Also reflect the agent's config (for cadence/staleness math) if it changes.
+    }
+
+    /// Watch config.json so the settings form refreshes on an external hand-edit
+    /// (SPEC-UI §9/§5 edge 5), and the banner staleness math tracks cadence changes.
+    private func armConfigWatch() {
+        configWatch?.cancel()
+        configWatch = FileWatcher(path: options.configPath, queue: work) { [weak self] in
+            self?.configTick()
+        }
+    }
+
+    /// 1 s display clock: re-derives the banner from the last-read state.json so the
+    /// "last poll Ns ago" readout ticks. Re-reads nothing heavy — just re-runs the
+    /// pure BannerDeriver against `now`. Cancelled on hide with everything else.
+    private func armDisplayTimer() {
+        displayTimer?.cancel()
+        let t = DispatchSource.makeTimerSource(queue: work)
+        t.schedule(deadline: .now() + 1, repeating: 1, leeway: .milliseconds(200))
+        t.setEventHandler { [weak self] in self?.tickBanner() }
+        t.resume()
+        displayTimer = t
     }
 
     // MARK: - Lane ticks (run on `work`)
@@ -235,10 +359,36 @@ final class UIModel: ObservableObject {
     /// agent state-machine status. Pure derivation from the file (SPEC-UI §5/§7.2).
     private func agentTick() {
         let snapshot = stateStore.read()
+        lastAgentSnapshot = snapshot
         latestAgent = AgentFactsDeriver.derive(from: snapshot, config: config)
         let banner = BannerDeriver.derive(snapshot: snapshot, now: Date(), config: config)
-        DispatchQueue.main.async { [weak self] in self?.banner = banner }
+        // A fresh heartbeat means the agent is alive again — clear any stale Start error.
+        let clearStartFailed = (banner != .dead)
+        DispatchQueue.main.async { [weak self] in
+            self?.banner = banner
+            if clearStartFailed { self?.startFailed = false }
+        }
         publish()
+    }
+
+    /// 1 s re-derivation of the banner against a fresh `now` (the ticking "last poll
+    /// Ns ago"). Pure; touches no I/O. Skips publishing the rows.
+    private func tickBanner() {
+        let banner = BannerDeriver.derive(snapshot: lastAgentSnapshot, now: Date(), config: config)
+        DispatchQueue.main.async { [weak self] in self?.banner = banner }
+    }
+
+    /// Config file changed externally (hand-edit) → reload the latest struct so the
+    /// settings form re-seeds and the banner uses the new cadence. The agent has its
+    /// own ConfigStore + hot-reload; this is purely the UI's read-side refresh.
+    private func configTick() {
+        let cfg = configStore.load()
+        config = cfg
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.loadedConfig = cfg
+            self.settingsRevision &+= 1
+        }
     }
 
     /// Merge the three lanes' latest snapshots and push to the main thread.
