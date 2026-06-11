@@ -20,6 +20,13 @@ final class UIModel: ObservableObject {
     @Published private(set) var banner: BannerState = .dead
     /// True when the most recent slow tick failed lsof (M3 disables Kill Orphans).
     @Published private(set) var ownershipUnknown: Bool = false
+    /// Latest post-kill toast (SPEC-UI §6); nil when there is nothing to show. The
+    /// view drives the auto-dismiss timer and clears it via `dismissToast()`.
+    @Published private(set) var toast: KillPlanner.ToastSummary?
+    /// True while a kill batch runs — the view disables every kill button so a
+    /// second batch can't be queued on top of the first (SPEC-UI §6). Lanes keep
+    /// updating regardless.
+    @Published private(set) var killInFlight = false
 
     // MARK: - Lanes
 
@@ -31,6 +38,7 @@ final class UIModel: ObservableObject {
     private let ideMonitor: IDEMonitor
     private let stateStore: StateStore
     private let configStore: ConfigStore
+    private let killCoordinator: KillCoordinator
 
     private var config: Config
 
@@ -64,7 +72,35 @@ final class UIModel: ObservableObject {
         self.stateStore = StateStore(path: options.statePath, logger: logger)
         self.sampler = FastLaneSampler(idleCpuSecondsPerPoll: config.idleCpuSecondsPerPoll,
                                        pollIntervalSeconds: config.pollIntervalSeconds)
+        self.killCoordinator = KillCoordinator(
+            options: options, logger: logger, scanner: scanner,
+            resolver: resolver, ideMonitor: ideMonitor, configStore: configStore)
     }
+
+    // MARK: - Kills (SPEC-UI §6)
+
+    /// Run a kill batch against the given rows under `policy`, then surface a toast.
+    /// Disables further kills until the batch resolves (no double-batching). The
+    /// caller (view) is responsible for routing every `.userForced` request through
+    /// a confirmation dialog FIRST — `policy` is whatever `KillPlanner` decided and
+    /// the planner only yields `.userForced` for dialog-bearing friction tiers.
+    func requestKill(_ rows: [DaemonRow], policy: KillPolicy) {
+        guard !killInFlight, !rows.isEmpty else { return }
+        killInFlight = true
+        let identities = rows.map(\.identity)
+        killCoordinator.kill(identities: identities, policy: policy) { [weak self] reports in
+            guard let self else { return }
+            self.killInFlight = false
+            self.toast = KillPlanner.toast(from: reports)
+            // Pull a fresh ownership pass so killed daemons drop out promptly rather
+            // than waiting up to a full slow tick (the fast lane already drops them
+            // within 2 s, this just refreshes verdicts for survivors).
+            self.refreshOnFocus()
+        }
+    }
+
+    /// Clear the toast (the view's auto-dismiss timer fires this after ~4 s).
+    func dismissToast() { toast = nil }
 
     // MARK: - Lifecycle (cancel-on-hide, SPEC-UI §5/§11)
 
