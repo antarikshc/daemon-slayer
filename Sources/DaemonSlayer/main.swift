@@ -8,9 +8,13 @@ case .failure(let err):
     exit(64)
 case .success(let options):
     switch options.mode {
-    case .none, .help:
+    case .help:
         print(usageText)
-        exit(options.mode == .help ? 0 : 64)
+        exit(0)
+    case .none, .ui:
+        // No args (Finder double-click) or explicit --ui → status & control window
+        // (SPEC-UI §4). Never returns; the UI process quits on last window close.
+        UIApp.run(options: options)
     case .version:
         print(daemonSlayerVersion)
         exit(0)

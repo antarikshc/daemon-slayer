@@ -10,7 +10,7 @@ enum DSPaths {
 }
 
 enum CLIMode: Equatable {
-    case agent, status, scanOnce, version, help
+    case agent, status, scanOnce, version, help, ui
     /// Hidden test/debug entry point (NOT shown in --help): one-shot kill of a
     /// single pid under an explicit policy. This is the ONLY place `.userForced`
     /// can originate; the agent poll loop has no path to it. Used by the
@@ -47,6 +47,7 @@ struct CLIOptions {
             case "--status": opts.mode = .status
             case "--scan-once": opts.mode = .scanOnce
             case "--version": opts.mode = .version
+            case "--ui": opts.mode = .ui
             case "--help", "-h": opts.mode = .help
             case "--kill-pid":
                 guard let v = value(for: arg), let pid = Int32(v) else {
@@ -96,6 +97,7 @@ USAGE: daemonslayer <mode> [options]
 
 MODES:
   --agent        run the resident watcher (launchd entry point)
+  --ui           open the status & control window (also the default with no args)
   --status       one-shot scan merged with the resident agent's view (debugging tool)
   --scan-once    one-shot scan, fresh verdicts only
   --version      print version
