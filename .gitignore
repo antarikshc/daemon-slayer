@@ -6,5 +6,5 @@ dist/
 *.log
 # docs are intentionally untracked
 SPEC.md
-PLAN.md
+SPEC-UI.md
 .claude/
