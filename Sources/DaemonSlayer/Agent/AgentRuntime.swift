@@ -21,8 +21,14 @@ final class AgentRuntime {
     private var currentInterval: Double = 0
     private var lastPollAt = Date.distantPast
     private var lastIDERunning = false
+    // Retained because NSApplication.delegate is weak (bundle branch of run()).
+    private var reopenRelay: ReopenRelay?
+    private let configPath: String
+    private let statePath: String
 
     init(configPath: String, statePath: String, logPath: String?) {
+        self.configPath = configPath
+        self.statePath = statePath
         let logger = FileLogger(path: logPath, minLevel: .info)
         self.logger = logger
         configStore = ConfigStore(path: configPath, logger: logger)
@@ -95,6 +101,12 @@ final class AgentRuntime {
         if Bundle.main.bundleIdentifier != nil {
             let app = NSApplication.shared
             app.setActivationPolicy(.prohibited)
+            // The agent is the LS-registered instance of the bundle, so Finder/
+            // Spotlight double-clicks land here as reopen events — relay them to
+            // a UI process (SPEC-UI §4) instead of dropping them.
+            let relay = ReopenRelay(configPath: configPath, statePath: statePath, logger: logger)
+            reopenRelay = relay
+            app.delegate = relay
             app.run()
         } else {
             RunLoop.main.run()
