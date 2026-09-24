@@ -90,7 +90,7 @@ Check System Settings → General → Login Items & Extensions: DaemonSlayer mus
 This happens with an app someone else built and sent you, because macOS quarantines downloaded apps. Build it yourself with the steps above. Locally built apps aren't quarantined.
 
 **Will it kill my running builds?**
-Not automatically. Auto-kill is off by default, so the agent only notifies. A daemon with an attached client (a running build, or an IDE that owns it) counts as owned and is never flagged. Everything is configurable in `config.json`.
+Not automatically. Auto-kill is off by default, so the agent only notifies. A daemon with an attached client (a running build, or an IDE that owns it) counts as owned. It's only flagged after 2 h of idleness, never while it's busy. Everything is configurable in `config.json`.
 
 **Is a `daemonslayer` command on my PATH?**
 Only if `/usr/local/bin` is writable; `make install` symlinks it there. Otherwise run `~/Applications/DaemonSlayer.app/Contents/MacOS/daemonslayer --help`.
