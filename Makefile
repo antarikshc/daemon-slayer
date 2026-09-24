@@ -2,7 +2,7 @@
 
 APP_NAME      = DaemonSlayer
 BUNDLE_ID     = dev.antariksh.daemonslayer
-SIGN_IDENTITY ?= daemonslayer-dev
+SIGN_IDENTITY ?= Apple Development
 INSTALL_DIR   ?= $(HOME)/Applications
 DIST          = dist
 CONFIG        ?= release
@@ -25,8 +25,8 @@ build:
 	cp "$(BIN)" "$(APP)/Contents/MacOS/daemonslayer"
 	cp packaging/Info.plist "$(APP)/Contents/Info.plist"
 	printf 'APPL????' > "$(APP)/Contents/PkgInfo"
-	# Stable self-signed identity (spec 9.1), NOT ad-hoc — keeps TCC notification
-	# permission sticky across rebuilds. First sign may pop a keychain prompt.
+	# Stable Apple-issued identity, NOT ad-hoc — keeps TCC notification permission
+	# sticky across rebuilds and cert renewals. First sign may pop a keychain prompt.
 	@echo ">> Codesigning with identity '$(SIGN_IDENTITY)' — macOS may prompt for keychain access on first run."
 	codesign --force --sign "$(SIGN_IDENTITY)" --identifier $(BUNDLE_ID) "$(APP)"
 	codesign --verify --deep --strict "$(APP)"

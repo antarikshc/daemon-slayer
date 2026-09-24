@@ -15,6 +15,9 @@
 	<!-- Relaunch on crash; long-running resident process, not StartInterval (spec 9.1) -->
 	<key>KeepAlive</key>
 	<true/>
+	<!-- Attributes this item to the app in Login Items; otherwise macOS lists it under the signing developer's name -->
+	<key>AssociatedBundleIdentifiers</key>
+	<string>dev.antariksh.daemonslayer</string>
 	<key>ProcessType</key>
 	<string>Background</string>
 	<!-- launchd does NOT expand $HOME, so @HOME@ is substituted to a literal path at install time -->

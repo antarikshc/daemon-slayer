@@ -22,7 +22,7 @@ make status                                    # run --status against installed 
 
 CLI modes of the binary: `--agent` (poll loop, what launchd runs), `--status` (debug view of verdicts), `--scan-once`, `--version`; `--config/--state-file/--log-file` override paths (the integration harness relies on these).
 
-Codesigning uses a stable self-signed Keychain identity `daemonslayer-dev` (not ad-hoc) so TCC notification permission survives rebuilds. `make build` will fail without it.
+Codesigning uses the Apple Development identity in `SIGN_IDENTITY` (Makefile; not ad-hoc) so TCC notification permission survives rebuilds. `make build` fails if that identity isn't in the Keychain — override with `make build SIGN_IDENTITY="..."`.
 
 ## Architecture
 
