@@ -60,7 +60,7 @@ final class AgentRuntime {
                     self?.writeState()
                 }
             }
-        ))
+        ), reNotifyWindow: config.snoozeMinutes * 60)
         killer = Killer(logger: logger, deps: KillerDependencies(
             escalationSeconds: { [weak self] in self?.config.killEscalationSeconds ?? 10 },
             freshSnapshot: { [weak self] in self?.freshSnapshot() }
@@ -213,6 +213,7 @@ final class AgentRuntime {
         logger.minLevel = newConfig.logLevelValue
         ideMonitor.updatePrefixes(newConfig.ownerAppBundlePrefixes)
         engine.updateConfig(newConfig)
+        notifier.reNotifyWindow = newConfig.snoozeMinutes * 60
         // Do NOT touch the timer here: rescheduling on every save resets the timer
         // PHASE (repeated saves can starve polling) and pins fast cadence even when
         // idle. Instead run one immediate out-of-band poll (apply() already runs on

@@ -37,6 +37,17 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
     private let logger: DSLogger
     private let actions: NotificationActions
 
+    /// Per-daemon re-notification gate (spec §6 / honesty). Suppresses repeat
+    /// alerts about the same orphaned/runaway JVM within the window.
+    private var deduper: NotificationDeduper
+
+    /// Re-notify spacing for one daemon, in seconds. The wiring layer keeps this in
+    /// sync with `config.snoozeMinutes` on hot-reload.
+    var reNotifyWindow: TimeInterval {
+        get { deduper.window }
+        set { deduper.window = newValue }
+    }
+
     /// true outside an .app bundle — UNUserNotificationCenter must not be touched.
     private(set) var dryRun: Bool
 
@@ -44,9 +55,10 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
     /// this for state.json / `--status` permission reporting (spec §11, §13/11).
     private(set) var authorized: Bool?
 
-    init(logger: DSLogger, actions: NotificationActions) {
+    init(logger: DSLogger, actions: NotificationActions, reNotifyWindow: TimeInterval = 3600) {
         self.logger = logger
         self.actions = actions
+        self.deduper = NotificationDeduper(window: reNotifyWindow)
         // Bundle identifier is the canonical "are we in a bundle?" probe; it is
         // exactly what UNUserNotificationCenter checks before it traps.
         self.dryRun = Bundle.main.bundleIdentifier == nil
@@ -124,6 +136,14 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
     /// is stable per process-set so re-notifications REPLACE the prior entry in
     /// Notification Center rather than piling up (spec §6).
     func post(_ batch: NotificationBatch) {
+        // Suppress repeat alerts about the same daemon(s) within the re-notify
+        // window — the spam backstop (see NotificationDeduper). Applied uniformly
+        // (incl. dryRun) so the dry-run log reflects what would actually be posted.
+        guard deduper.admit(batch, now: Date()) else {
+            logger.debug("suppressed re-notification within window: \(batch.identifier)")
+            return
+        }
+
         let title = title(for: batch)
         let body = body(for: batch)
 
