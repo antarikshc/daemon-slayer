@@ -2,8 +2,8 @@
 
 APP_NAME      = DaemonSlayer
 BUNDLE_ID     = dev.antariksh.daemonslayer
-# Ad-hoc by default so anyone can build. Put a real identity in the untracked
-# Makefile.local (SIGN_IDENTITY = ...) to keep notification permission across rebuilds.
+# Ad-hoc by default so anyone can build without a certificate. An identity in the
+# untracked Makefile.local (SIGN_IDENTITY = ...) takes precedence.
 -include Makefile.local
 SIGN_IDENTITY ?= -
 INSTALL_DIR   ?= $(HOME)/Applications
@@ -28,8 +28,6 @@ build:
 	cp "$(BIN)" "$(APP)/Contents/MacOS/daemonslayer"
 	cp packaging/Info.plist "$(APP)/Contents/Info.plist"
 	printf 'APPL????' > "$(APP)/Contents/PkgInfo"
-	# Ad-hoc signatures change every build, so macOS re-asks for notification
-	# permission; a stable identity from Makefile.local avoids that.
 	@echo ">> Codesigning with identity '$(SIGN_IDENTITY)' — macOS may prompt for keychain access on first run."
 	codesign --force --sign "$(SIGN_IDENTITY)" --identifier $(BUNDLE_ID) "$(APP)"
 	codesign --verify --deep --strict "$(APP)"

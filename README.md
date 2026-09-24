@@ -17,7 +17,7 @@ Nothing is killed unless you say so: auto-kill is off by default. Kills are grac
 
 ## Install
 
-Build from source and sign with your own Apple Development certificate. See **[INSTALL.md](INSTALL.md)**.
+Build from source. You only need Apple's Command Line Tools: no Xcode, no developer account. See **[INSTALL.md](INSTALL.md)**.
 
 ```sh
 make install

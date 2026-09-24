@@ -22,7 +22,7 @@ make status                                    # run --status against installed 
 
 CLI modes of the binary: `--agent` (poll loop, what launchd runs), `--status` (debug view of verdicts), `--scan-once`, `--version`; `--config/--state-file/--log-file` override paths (the integration harness relies on these).
 
-Codesigning is ad-hoc by default. Set `SIGN_IDENTITY = <Keychain identity>` in the untracked `Makefile.local` to sign with a stable identity, which keeps TCC notification permission across rebuilds (ad-hoc re-prompts every build).
+Codesigning is ad-hoc by default (no Xcode or certificate needed; notification permission is keyed on the bundle ID, so it survives ad-hoc rebuilds). `SIGN_IDENTITY = <Keychain identity>` in the untracked `Makefile.local` overrides it.
 
 ## Architecture
 
