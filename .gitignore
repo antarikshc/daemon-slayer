@@ -9,3 +9,4 @@ SPEC.md
 SPEC-UI.md
 PLAN-V2.md
 .claude/
+Makefile.local

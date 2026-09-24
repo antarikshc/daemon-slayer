@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-DaemonSlayer — a macOS menu-less LaunchAgent (Swift, zero dependencies, macOS 13+) that detects orphaned Gradle/Kotlin daemon JVMs and notifies/kills them. `SPEC.md` in the repo root is the authoritative design doc for the v1 agent (detection rules, kill semantics, config schema); `SPEC-UI.md` is the v2 spec for the on-demand status/control window. Both are intentionally untracked in git — read them locally, don't commit them.
+DaemonSlayer — a macOS menu-less LaunchAgent (Swift, zero dependencies, macOS 13+) that detects orphaned Gradle/Kotlin daemon JVMs and notifies/kills them. The design specs (`SPEC.md` for the v1 agent, `SPEC-UI.md` for the v2 status/control window) are private and not published with this repo. If they exist in your checkout they are authoritative, gitignored, and must stay uncommitted; otherwise treat the code and tests as the source of truth.
 
 ## Commands
 
@@ -22,7 +22,7 @@ make status                                    # run --status against installed 
 
 CLI modes of the binary: `--agent` (poll loop, what launchd runs), `--status` (debug view of verdicts), `--scan-once`, `--version`; `--config/--state-file/--log-file` override paths (the integration harness relies on these).
 
-Codesigning uses the Apple Development identity in `SIGN_IDENTITY` (Makefile; not ad-hoc) so TCC notification permission survives rebuilds. `make build` fails if that identity isn't in the Keychain — override with `make build SIGN_IDENTITY="..."`.
+Codesigning is ad-hoc by default. Set `SIGN_IDENTITY = <Keychain identity>` in the untracked `Makefile.local` to sign with a stable identity, which keeps TCC notification permission across rebuilds (ad-hoc re-prompts every build).
 
 ## Architecture
 
